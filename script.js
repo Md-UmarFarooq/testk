@@ -412,15 +412,28 @@ async function startBatchConversion() {
     }
 
     // Run the conversion loop
-    for (let i = 0; i < selectedFiles.length; i++) {
-        if (!isConverting) break; 
-        if (conversionResults[i] && conversionResults[i].status === 'success') {
-            updateProgress(i, 100);
-            continue; 
+    const isMobile = navigator.hardwareConcurrency <= 4 || /Mobi|Android/i.test(navigator.userAgent);
+const concurrency = isMobile ? 2 : 4;
+
+async function processQueue() {
+    let i = 0;
+    async function next() {
+        while (i < selectedFiles.length) {
+            if (!isConverting) return;
+            const current = i++;
+            if (conversionResults[current] && conversionResults[current].status === 'success') {
+                updateProgress(current, 100);
+                continue;
+            }
+            await convertSingleFile(current);
+            await new Promise(r => setTimeout(r, 50));
         }
-        await convertSingleFile(i);
-        await new Promise(r => setTimeout(r, 50)); 
     }
+    const workers = Array.from({ length: concurrency }, next);
+    await Promise.all(workers);
+}
+
+await processQueue();
     finalizeConversion();
 }
 
@@ -495,8 +508,8 @@ window.qualityMode = 'best'; // Global source of truth
 async function initConverter() {
     try {
         const [upngRes, pakoRes] = await Promise.all([
-            fetch('upng.js'),
-            fetch('pako.js')
+            fetch('/jpg-to-png/upng.js'),
+            fetch('/jpg-to-png/pako.js')
         ]);
         const upngCode = await upngRes.text();
         const pakoCode = await pakoRes.text();
