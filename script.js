@@ -412,28 +412,24 @@ async function startBatchConversion() {
     }
 
     // Run the conversion loop
-    const isMobile = navigator.hardwareConcurrency <= 4 || /Mobi|Android/i.test(navigator.userAgent);
-const concurrency = isMobile ? 2 : 4;
+    // Replace the loop in startBatchConversion with this:
+for (let i = 0; i < selectedFiles.length; i++) {
+    if (!isConverting) break; 
 
-async function processQueue() {
-    let i = 0;
-    async function next() {
-        while (i < selectedFiles.length) {
-            if (!isConverting) return;
-            const current = i++;
-            if (conversionResults[current] && conversionResults[current].status === 'success') {
-                updateProgress(current, 100);
-                continue;
-            }
-            await convertSingleFile(current);
-            await new Promise(r => setTimeout(r, 50));
-        }
+    // Skip if already done
+    if (conversionResults[i] && conversionResults[i].status === 'success') {
+        updateProgress(i, 100);
+        continue; 
     }
-    const workers = Array.from({ length: concurrency }, next);
-    await Promise.all(workers);
-}
 
-await processQueue();
+    // 1. Process ONE file at a time and WAIT for it to finish completely
+    await convertSingleFile(i);
+
+    // 2. THE SECRET SAUCE: The "Cool-down" period
+    // This 300ms gives the mobile CPU/RAM a moment to "breathe" 
+    // and clear the memory used by the previous image blob.
+    await new Promise(r => setTimeout(r, 300)); 
+}
     finalizeConversion();
 }
 
