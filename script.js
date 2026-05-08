@@ -385,7 +385,33 @@ async function startBatchConversion() {
     if (allDone) { showMessage('All files are already converted! ✨'); return; }
     if (isConverting) return;
 
-    // 🔥 FIX 1: Ensure all weights are ready so the denominator isn't zero
+    // 📱 1. AGGRESSIVE MOBILE PREPARATION
+    const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+    
+    if (isMobile) {
+        // Force-reduce worker pool to strictly ONE worker to prevent multi-thread RAM spikes
+        if (Array.isArray(jpgPngWorkers) && jpgPngWorkers.length > 0) {
+            jpgPngWorkers.forEach((w, idx) => {
+                if (idx > 0 && w instanceof Worker) {
+                    w.terminate(); // Kill excess threads immediately
+                }
+            });
+            jpgPngWorkers = [jpgPngWorkers[0]]; // Keep only one active worker
+            jpgWorkerIndex = 0;
+        }
+
+        // Clean up UI preview cards to free up decoded DOM image memory
+        const previewImages = document.querySelectorAll('.preview-card img');
+        previewImages.forEach(img => {
+            const oldSrc = img.src;
+            if (oldSrc.startsWith('blob:')) {
+                img.removeAttribute('src'); // Unlink image from memory
+                URL.revokeObjectURL(oldSrc); // Free the RAM allocated by the preview blob
+            }
+        });
+    }
+
+    // 2. Ensure all weights are ready so the denominator isn't zero
     await Promise.all(selectedFiles.map(f => getFileWeight(f)));
     
     totalPixelsInBatch = selectedFiles.reduce((acc, f) => acc + (f.pixelWeight || 0), 0);
@@ -393,7 +419,7 @@ async function startBatchConversion() {
     isConverting = true;
     showProgressModal(); 
 
-    // 🔥 FIX 2: If files were already converted (standalone), add them to bar NOW
+    // 3. If files were already converted (standalone), add them to bar NOW
     selectedFiles.forEach((f, i) => {
         if (conversionResults[i] && conversionResults[i].status === 'success') {
             fileContributions[i] = f.pixelWeight;
@@ -411,11 +437,7 @@ async function startBatchConversion() {
         convertBtn.textContent = 'Processing...';
     }
 
-    // 📱 DETECT MOBILE: Check if we need to throttle to save RAM
-    const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-    const coolDownTime = isMobile ? 350 : 50; // 350ms for mobile safety, 50ms for desktop speed
-
-    // Run the conversion loop
+    // 4. Run the conversion loop
     for (let i = 0; i < selectedFiles.length; i++) {
         if (!isConverting) break; 
         if (conversionResults[i] && conversionResults[i].status === 'success') {
@@ -423,12 +445,14 @@ async function startBatchConversion() {
             continue; 
         }
 
-        // Process file
+        // Strict single execution
         await convertSingleFile(i);
 
-        // Apply adaptive cool-down based on the device
+        // Mobile requires a slightly longer break to clear GC before starting next file
+        const coolDownTime = isMobile ? 400 : 50; 
         await new Promise(r => setTimeout(r, coolDownTime)); 
     }
+    
     finalizeConversion();
 }
 
