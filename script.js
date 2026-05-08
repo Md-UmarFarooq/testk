@@ -385,33 +385,7 @@ async function startBatchConversion() {
     if (allDone) { showMessage('All files are already converted! ✨'); return; }
     if (isConverting) return;
 
-    // 📱 1. AGGRESSIVE MOBILE PREPARATION
-    const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-    
-    if (isMobile) {
-        // Force-reduce worker pool to strictly ONE worker to prevent multi-thread RAM spikes
-        if (Array.isArray(jpgPngWorkers) && jpgPngWorkers.length > 0) {
-            jpgPngWorkers.forEach((w, idx) => {
-                if (idx > 0 && w instanceof Worker) {
-                    w.terminate(); // Kill excess threads immediately
-                }
-            });
-            jpgPngWorkers = [jpgPngWorkers[0]]; // Keep only one active worker
-            jpgWorkerIndex = 0;
-        }
-
-        // Clean up UI preview cards to free up decoded DOM image memory
-        const previewImages = document.querySelectorAll('.preview-card img');
-        previewImages.forEach(img => {
-            const oldSrc = img.src;
-            if (oldSrc.startsWith('blob:')) {
-                img.removeAttribute('src'); // Unlink image from memory
-                URL.revokeObjectURL(oldSrc); // Free the RAM allocated by the preview blob
-            }
-        });
-    }
-
-    // 2. Ensure all weights are ready so the denominator isn't zero
+    // 🔥 FIX 1: Ensure all weights are ready so the denominator isn't zero
     await Promise.all(selectedFiles.map(f => getFileWeight(f)));
     
     totalPixelsInBatch = selectedFiles.reduce((acc, f) => acc + (f.pixelWeight || 0), 0);
@@ -419,7 +393,7 @@ async function startBatchConversion() {
     isConverting = true;
     showProgressModal(); 
 
-    // 3. If files were already converted (standalone), add them to bar NOW
+    // 🔥 FIX 2: If files were already converted (standalone), add them to bar NOW
     selectedFiles.forEach((f, i) => {
         if (conversionResults[i] && conversionResults[i].status === 'success') {
             fileContributions[i] = f.pixelWeight;
@@ -437,22 +411,16 @@ async function startBatchConversion() {
         convertBtn.textContent = 'Processing...';
     }
 
-    // 4. Run the conversion loop
+    // Run the conversion loop
     for (let i = 0; i < selectedFiles.length; i++) {
         if (!isConverting) break; 
         if (conversionResults[i] && conversionResults[i].status === 'success') {
             updateProgress(i, 100);
             continue; 
         }
-
-        // Strict single execution
         await convertSingleFile(i);
-
-        // Mobile requires a slightly longer break to clear GC before starting next file
-        const coolDownTime = isMobile ? 400 : 50; 
-        await new Promise(r => setTimeout(r, coolDownTime)); 
+        await new Promise(r => setTimeout(r, 50)); 
     }
-    
     finalizeConversion();
 }
 
@@ -533,64 +501,81 @@ async function initConverter() {
         const upngCode = await upngRes.text();
         const pakoCode = await pakoRes.text();
 
-        const numWorkers = Math.min(navigator.hardwareConcurrency || 4, 6);
+        // 📱 DETECT MOBILE: Check if we are on a phone or tablet
+        const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+
+        // 🧠 CHOOSE WORKERS: Force exactly 1 on mobile to prevent crashes.
+        // On desktop, scale with CPU cores up to 6.
+        const numWorkers = isMobile ? 1 : Math.min(navigator.hardwareConcurrency || 4, 6);
         
-        for (let i = 0; i < numWorkers; i++) {
-            const workerCode = `
-                const window = self;
-                const global = self;
-                ${pakoCode}
-                ${upngCode}
-                
-                self.onmessage = async (e) => {
-                    try {
-                        const { buffer, mode } = e.data;
-                        self.postMessage({ type: 'progress', percent: 10 });
-                        // Convert buffer back to blob for bitmap
-                        const blob = new Blob([buffer]);
-                        const bitmap = await createImageBitmap(blob);
-                        self.postMessage({ type: 'progress', percent: 30 });
-                        
-                        const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-                        const ctx = canvas.getContext("2d", { 
-                            alpha: true, 
-                            desynchronized: true // 🔥 DEEP OPTIMIZATION: Reduces latency
-                        });
-                        
-                        ctx.imageSmoothingEnabled = false; // 🔥 Speed up draw
-                        ctx.drawImage(bitmap, 0, 0);
-                        self.postMessage({ type: 'progress', percent: 50 });
-                        
-                        let finalBuffer;
-                        if (mode === 'optimized') {
-                            const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height).data;
-                            self.postMessage({ type: 'progress', percent: 70 });
-                            finalBuffer = UPNG.encode([imageData.buffer], bitmap.width, bitmap.height, 256);
-                        } else {
-                            self.postMessage({ type: 'progress', percent: 60 });
-                            const finalBlob = await canvas.convertToBlob({ type: "image/png" });
-                            self.postMessage({ type: 'progress', percent: 80 });
-                            finalBuffer = await finalBlob.arrayBuffer();
-                        }
+        console.log(`System: ${isMobile ? 'Mobile' : 'Desktop'} | Spawning ${numWorkers} worker(s).`);
 
-                        bitmap.close();
-                        ctx.clearRect(0, 0, canvas.width, canvas.height);
-                        canvas.width = 1;
-                        canvas.height = 1;
+        // Force-clear any existing workers in the pool before rebuilding
+        if (Array.isArray(jpgPngWorkers)) {
+            jpgPngWorkers.forEach(w => { if (w instanceof Worker) w.terminate(); });
+        }
+        jpgPngWorkers = [];
 
-                        self.postMessage({ type: 'progress', percent: 100 });
-                        self.postMessage({ buffer: finalBuffer }, [finalBuffer]);
-
-                    } catch (err) {
-                        self.postMessage({ error: err.message });
+        const workerCode = `
+            const window = self;
+            const global = self;
+            ${pakoCode}
+            ${upngCode}
+            
+            self.onmessage = async (e) => {
+                try {
+                    const { buffer, mode } = e.data;
+                    self.postMessage({ type: 'progress', percent: 10 });
+                    
+                    // Convert buffer back to blob for bitmap
+                    const blob = new Blob([buffer]);
+                    const bitmap = await createImageBitmap(blob);
+                    self.postMessage({ type: 'progress', percent: 30 });
+                    
+                    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+                    const ctx = canvas.getContext("2d", { 
+                        alpha: true, 
+                        desynchronized: true
+                    });
+                    
+                    ctx.imageSmoothingEnabled = false;
+                    ctx.drawImage(bitmap, 0, 0);
+                    self.postMessage({ type: 'progress', percent: 50 });
+                    
+                    let finalBuffer;
+                    if (mode === 'optimized') {
+                        const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height).data;
+                        self.postMessage({ type: 'progress', percent: 70 });
+                        finalBuffer = UPNG.encode([imageData.buffer], bitmap.width, bitmap.height, 256);
+                    } else {
+                        self.postMessage({ type: 'progress', percent: 60 });
+                        const finalBlob = await canvas.convertToBlob({ type: "image/png" });
+                        self.postMessage({ type: 'progress', percent: 80 });
+                        finalBuffer = await finalBlob.arrayBuffer();
                     }
-                };
-            `;
+
+                    bitmap.close();
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    canvas.width = 1;
+                    canvas.height = 1;
+
+                    self.postMessage({ type: 'progress', percent: 100 });
+                    self.postMessage({ buffer: finalBuffer }, [finalBuffer]);
+
+                } catch (err) {
+                    self.postMessage({ error: err.message });
+                }
+            };
+        `;
+
+        for (let i = 0; i < numWorkers; i++) {
             const workerUrl = URL.createObjectURL(new Blob([workerCode], { type: "application/javascript" }));
             const worker = new Worker(workerUrl);
             URL.revokeObjectURL(workerUrl);
             jpgPngWorkers.push(worker);
         }
+        
+        jpgWorkerIndex = 0;
         console.log("Converter Engine Ready.");
     } catch (err) {
         console.error("Failed to start converter:", err);
