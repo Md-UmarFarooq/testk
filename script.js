@@ -411,25 +411,24 @@ async function startBatchConversion() {
         convertBtn.textContent = 'Processing...';
     }
 
+    // 📱 DETECT MOBILE: Check if we need to throttle to save RAM
+    const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+    const coolDownTime = isMobile ? 350 : 50; // 350ms for mobile safety, 50ms for desktop speed
+
     // Run the conversion loop
-    // Replace the loop in startBatchConversion with this:
-for (let i = 0; i < selectedFiles.length; i++) {
-    if (!isConverting) break; 
+    for (let i = 0; i < selectedFiles.length; i++) {
+        if (!isConverting) break; 
+        if (conversionResults[i] && conversionResults[i].status === 'success') {
+            updateProgress(i, 100);
+            continue; 
+        }
 
-    // Skip if already done
-    if (conversionResults[i] && conversionResults[i].status === 'success') {
-        updateProgress(i, 100);
-        continue; 
+        // Process file
+        await convertSingleFile(i);
+
+        // Apply adaptive cool-down based on the device
+        await new Promise(r => setTimeout(r, coolDownTime)); 
     }
-
-    // 1. Process ONE file at a time and WAIT for it to finish completely
-    await convertSingleFile(i);
-
-    // 2. THE SECRET SAUCE: The "Cool-down" period
-    // This 300ms gives the mobile CPU/RAM a moment to "breathe" 
-    // and clear the memory used by the previous image blob.
-    await new Promise(r => setTimeout(r, 300)); 
-}
     finalizeConversion();
 }
 
