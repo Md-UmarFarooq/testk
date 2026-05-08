@@ -523,17 +523,22 @@ async function initConverter() {
             ${upngCode}
             
             self.onmessage = async (e) => {
+                let bitmap = null;
+                let canvas = null;
+                let ctx = null;
+                let finalBuffer = null;
+
                 try {
                     const { buffer, mode } = e.data;
                     self.postMessage({ type: 'progress', percent: 10 });
                     
                     // Convert buffer back to blob for bitmap
                     const blob = new Blob([buffer]);
-                    const bitmap = await createImageBitmap(blob);
+                    bitmap = await createImageBitmap(blob);
                     self.postMessage({ type: 'progress', percent: 30 });
                     
-                    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-                    const ctx = canvas.getContext("2d", { 
+                    canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+                    ctx = canvas.getContext("2d", { 
                         alpha: true, 
                         desynchronized: true
                     });
@@ -542,28 +547,53 @@ async function initConverter() {
                     ctx.drawImage(bitmap, 0, 0);
                     self.postMessage({ type: 'progress', percent: 50 });
                     
-                    let finalBuffer;
+                    // Free raw bitmap immediately after drawing to save memory
+                    bitmap.close();
+                    bitmap = null;
+
                     if (mode === 'optimized') {
-                        const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height).data;
+                        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
                         self.postMessage({ type: 'progress', percent: 70 });
-                        finalBuffer = UPNG.encode([imageData.buffer], bitmap.width, bitmap.height, 256);
+                        finalBuffer = UPNG.encode([imageData.buffer], canvas.width, canvas.height, 256);
                     } else {
                         self.postMessage({ type: 'progress', percent: 60 });
-                        const finalBlob = await canvas.convertToBlob({ type: "image/png" });
+                        
+                        // 🚀 MEMORY FIX: Transfer image out of canvas before converting to blob.
+                        // This prevents holding raw pixel buffers and blobs in RAM at the same time.
+                        const imageBitmap = canvas.transferToImageBitmap();
+                        
+                        // Shrink canvas immediately to release GPU allocation
+                        ctx.clearRect(0, 0, canvas.width, canvas.height);
+                        canvas.width = 1;
+                        canvas.height = 1;
+                        
+                        self.postMessage({ type: 'progress', percent: 70 });
+                        
+                        const finalBlob = await imageBitmap.convertToBlob({ type: "image/png" });
+                        imageBitmap.close(); // Clean up intermediate bitmap memory
+                        
                         self.postMessage({ type: 'progress', percent: 80 });
                         finalBuffer = await finalBlob.arrayBuffer();
                     }
 
-                    bitmap.close();
-                    ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    canvas.width = 1;
-                    canvas.height = 1;
+                    // Aggressive clean up of the main context if not cleared in step above
+                    if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    if (canvas) {
+                        canvas.width = 1;
+                        canvas.height = 1;
+                    }
 
                     self.postMessage({ type: 'progress', percent: 100 });
                     self.postMessage({ buffer: finalBuffer }, [finalBuffer]);
 
                 } catch (err) {
                     self.postMessage({ error: err.message });
+                } finally {
+                    // Force dereference everything for Garbage Collection
+                    bitmap = null;
+                    canvas = null;
+                    ctx = null;
+                    finalBuffer = null;
                 }
             };
         `;
