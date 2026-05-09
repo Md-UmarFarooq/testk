@@ -8,6 +8,9 @@ const maxFileSize = 50 * 1024 * 1024; // 50MB
 let conversionResults = {};
 let isConverting = false;
 
+// Track active thumbnail generation tasks
+let pendingThumbnails = 0;
+
 let totalPixelsInBatch = 0;
 let fileContributions = {};
 let animationFrame = null;
@@ -301,9 +304,9 @@ function createFileCard(file, index) {
 }
 
 async function generatePreviewThumbnail(file, imgElement, loaderElement) {
+    pendingThumbnails++; // ⬆️ Task started
     try {
-        // If the image is MASSIVE, we tell the browser to only decode 
-        // a small portion of it into memory. This is the ultimate lag-fix.
+        // High-performance decoding to limit memory footprint
         const bitmap = await createImageBitmap(file, { 
             resizeWidth: 300, 
             resizeQuality: 'low' 
@@ -315,16 +318,37 @@ async function generatePreviewThumbnail(file, imgElement, loaderElement) {
         const ctx = canvas.getContext('2d');
         ctx.drawImage(bitmap, 0, 0);
 
-        imgElement.src = canvas.toDataURL('image/jpeg', 0.6); // Lower quality for preview
+        imgElement.src = canvas.toDataURL('image/jpeg', 0.6); // Lower quality for preview speed
         imgElement.style.display = 'block';
         if (loaderElement) loaderElement.style.display = 'none';
 
         bitmap.close();
     } catch (err) {
-        // Fallback for images that are TOO big for the browser's canvas limit
-        loaderElement.textContent = "Preview unavailable (Image too large)";
+        // Fallback for massive or corrupt images
+        if (loaderElement) loaderElement.textContent = "Preview unavailable";
+    } finally {
+        pendingThumbnails--; // ⬇️ Task finished (always executes)
     }
 }
+
+function waitForThumbnails() {
+    return new Promise((resolve) => {
+        // If there are no pending thumbnails, let CPU settle for a split-second and resolve
+        if (pendingThumbnails === 0) {
+            return setTimeout(resolve, 200); 
+        }
+        
+        const checkInterval = setInterval(() => {
+            if (pendingThumbnails === 0) {
+                clearInterval(checkInterval);
+                // The "Breathe" period: wait 300ms for garbage collection to settle
+                setTimeout(resolve, 300);
+            }
+        }, 100); 
+    });
+}
+
+
 
 // ============ UPDATE FILE CARD STATUS ============
 function updateFileCardStatus(index, status) {
@@ -376,7 +400,106 @@ function updateFileCardStatus(index, status) {
 }
 
 // ============ MAIN CONVERSION FUNCTIONS ============
+// ============ DEVICE & CONCURRENCY CLASSIFIER ============
+
+/**
+ * Robustly detects device type: 'desktop', 'tablet', or 'mobile'
+ */
+function getDeviceProfile() {
+    const ua = navigator.userAgent;
+    const isMobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+    
+    if (isMobileUA) {
+        // Check if it's a tablet based on screen width/height metrics
+        const maxDimension = Math.max(screen.width, screen.height);
+        const isTabletUA = /(ipad|tablet|playbook|silk)|(android(?!.*mobile))/i.test(ua);
+        
+        if (isTabletUA || (maxDimension >= 768 && maxDimension <= 1024)) {
+            return 'tablet';
+        }
+        return 'mobile';
+    }
+    
+    // Fallback detection for newer iPads that present as Desktop Safari
+    const isIPadOS = (navigator.maxTouchPoints && navigator.maxTouchPoints > 2 && /Macintosh/.test(ua));
+    if (isIPadOS) {
+        return 'tablet';
+    }
+    
+    return 'desktop';
+}
+
+/**
+ * Computes exact concurrency limit based on your production matrix
+ */
+function getConcurrencyLimit(file) {
+    if (!file || !file.pixelWeight) return 1; // Fallback
+
+    const pixels = file.pixelWeight;
+    const device = getDeviceProfile();
+    const mode = window.qualityMode || 'best';
+    
+    // Fallback to 4GB if API is unsupported (like on Firefox/Safari)
+    const ram = navigator.deviceMemory || 4; 
+
+    // ==========================================
+    // 1. DESKTOP / LAPTOP PROFILE
+    // ==========================================
+    if (device === 'desktop') {
+        if (mode === 'best') {
+            if (pixels <= 2000000)  return ram <= 4 ? 2 : (ram <= 8 ? 3 : 4); // ≤ 2MP
+            if (pixels <= 4000000)  return ram <= 4 ? 2 : (ram <= 8 ? 3 : 3); // ≤ 4MP
+            if (pixels <= 8000000)  return ram <= 4 ? 1 : (ram <= 8 ? 2 : 2); // ≤ 8MP
+            if (pixels <= 12000000) return ram <= 4 ? 1 : (ram <= 8 ? 2 : 2); // ≤ 12MP
+            return 1; // > 12MP (≤24MP and >24MP are strictly 1)
+        } else {
+            // 'optimized'
+            if (pixels <= 2000000)  return ram <= 4 ? 1 : (ram <= 8 ? 2 : 3); // ≤ 2MP
+            if (pixels <= 4000000)  return ram <= 4 ? 1 : (ram <= 8 ? 2 : 2); // ≤ 4MP
+            return 1; // > 4MP (≤8MP, ≤12MP, ≤24MP, >24MP are strictly 1)
+        }
+    }
+
+    // ==========================================
+    // 2. TABLET PROFILE
+    // ==========================================
+    if (device === 'tablet') {
+        if (mode === 'best') {
+            if (pixels <= 2000000) return ram <= 4 ? 2 : 3; // ≤ 2MP
+            if (pixels <= 4000000) return ram <= 4 ? 1 : 2; // ≤ 4MP
+            return 1; // > 4MP (≤8MP and >8MP are strictly 1)
+        } else {
+            // 'optimized' (Any RAM: 1)
+            return 1;
+        }
+    }
+
+    // ==========================================
+    // 3. MOBILE PHONE PROFILE
+    // ==========================================
+    if (device === 'mobile') {
+        if (mode === 'best') {
+            if (pixels <= 2000000) return ram <= 4 ? 1 : 2; // ≤ 2MP
+            if (pixels <= 4000000) return ram <= 4 ? 1 : 2; // ≤ 4MP
+            return 1; // > 4MP (≤8MP and >8MP are strictly 1)
+        } else {
+            // 'optimized' (Any RAM: 1)
+            return 1;
+        }
+    }
+
+    return 1; // Ultimate failsafe fallback
+}
+
+// ============ MAIN CONVERSION FUNCTIONS ============
 async function startBatchConversion() {
+    // 🛡️ THE THUMBNAIL GUARD
+    const guard = document.getElementById('thumbGuard');
+    if (pendingThumbnails > 0) {
+        if (guard) guard.style.display = 'flex';
+        await waitForThumbnails(); 
+        if (guard) guard.style.display = 'none';
+    }
     if (selectedFiles.length === 0) { showError('Please select files first'); return; }
 
     const allDone = selectedFiles.every((_, i) => 
@@ -385,7 +508,7 @@ async function startBatchConversion() {
     if (allDone) { showMessage('All files are already converted! ✨'); return; }
     if (isConverting) return;
 
-    // 🔥 FIX 1: Ensure all weights are ready so the denominator isn't zero
+    // Ensure all weights are ready so the denominator isn't zero
     await Promise.all(selectedFiles.map(f => getFileWeight(f)));
     
     totalPixelsInBatch = selectedFiles.reduce((acc, f) => acc + (f.pixelWeight || 0), 0);
@@ -393,7 +516,7 @@ async function startBatchConversion() {
     isConverting = true;
     showProgressModal(); 
 
-    // 🔥 FIX 2: If files were already converted (standalone), add them to bar NOW
+    // If files were already converted (standalone), add them to bar NOW
     selectedFiles.forEach((f, i) => {
         if (conversionResults[i] && conversionResults[i].status === 'success') {
             fileContributions[i] = f.pixelWeight;
@@ -411,16 +534,77 @@ async function startBatchConversion() {
         convertBtn.textContent = 'Processing...';
     }
 
-    // Run the conversion loop
-    for (let i = 0; i < selectedFiles.length; i++) {
-        if (!isConverting) break; 
-        if (conversionResults[i] && conversionResults[i].status === 'success') {
-            updateProgress(i, 100);
-            continue; 
+    // =========================================================
+    // 🔥 MATRIX-DRIVEN SLIDING CONCURRENCY QUEUE ENGINE
+    // =========================================================
+    
+    // Gather all file indices that actually need conversion
+    const pendingIndices = [];
+    selectedFiles.forEach((_, i) => {
+        if (!conversionResults[i] || conversionResults[i].status !== 'success') {
+            pendingIndices.push(i);
         }
-        await convertSingleFile(i);
-        await new Promise(r => setTimeout(r, 50)); 
-    }
+    });
+
+    let queueIndex = 0;        
+    let activeWorkerCount = 0;  
+
+    // This promise resolves once the entire batch finishes processing
+    await new Promise((resolveBatch) => {
+        
+        // Recursive worker runner
+        async function runNext() {
+            if (queueIndex >= pendingIndices.length || !isConverting) {
+                return;
+            }
+
+            const targetIndex = pendingIndices[queueIndex++];
+            activeWorkerCount++;
+
+            // Run conversion process for this file
+            await convertSingleFile(targetIndex);
+            
+            // Allow a brief 50ms breather for DOM rendering and Garbage Collection
+            await new Promise(r => setTimeout(r, 50)); 
+            
+            activeWorkerCount--;
+
+            if (!isConverting) {
+                if (activeWorkerCount === 0) resolveBatch();
+                return;
+            }
+
+            // Look ahead to check dynamic limits for the next file in the queue
+            const nextFileIndex = pendingIndices[queueIndex];
+            const nextFile = selectedFiles[nextFileIndex];
+            const allowedConcurrency = nextFile ? getConcurrencyLimit(nextFile) : 1;
+
+            // Spawn additional parallel runners if our load capacity allows it
+            while (activeWorkerCount < allowedConcurrency && queueIndex < pendingIndices.length && isConverting) {
+                runNext();
+            }
+
+            // If queue is exhausted and all active threads are complete
+            if (activeWorkerCount === 0 && queueIndex >= pendingIndices.length) {
+                resolveBatch();
+            }
+        }
+
+        // Kickstart the initial parallel processing threads
+        const firstFile = selectedFiles[pendingIndices[0]];
+        const initialConcurrencyCeiling = firstFile ? getConcurrencyLimit(firstFile) : 1;
+        const initialSpawns = Math.min(initialConcurrencyCeiling, pendingIndices.length);
+
+        for (let i = 0; i < initialSpawns; i++) {
+            if (!isConverting) break;
+            runNext();
+        }
+
+        if (pendingIndices.length === 0) {
+            resolveBatch();
+        }
+    });
+
     finalizeConversion();
 }
 
@@ -501,111 +685,64 @@ async function initConverter() {
         const upngCode = await upngRes.text();
         const pakoCode = await pakoRes.text();
 
-        // 📱 DETECT MOBILE: Check if we are on a phone or tablet
-        const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-
-        // 🧠 CHOOSE WORKERS: Force exactly 1 on mobile to prevent crashes.
-        // On desktop, scale with CPU cores up to 6.
-        const numWorkers = isMobile ? 1 : Math.min(navigator.hardwareConcurrency || 4, 6);
+        const numWorkers = Math.min(navigator.hardwareConcurrency || 4, 6);
         
-        console.log(`System: ${isMobile ? 'Mobile' : 'Desktop'} | Spawning ${numWorkers} worker(s).`);
-
-        // Force-clear any existing workers in the pool before rebuilding
-        if (Array.isArray(jpgPngWorkers)) {
-            jpgPngWorkers.forEach(w => { if (w instanceof Worker) w.terminate(); });
-        }
-        jpgPngWorkers = [];
-
-        const workerCode = `
-            const window = self;
-            const global = self;
-            ${pakoCode}
-            ${upngCode}
-            
-            self.onmessage = async (e) => {
-                let bitmap = null;
-                let canvas = null;
-                let ctx = null;
-                let finalBuffer = null;
-
-                try {
-                    const { buffer, mode } = e.data;
-                    self.postMessage({ type: 'progress', percent: 10 });
-                    
-                    // Convert buffer back to blob for bitmap
-                    const blob = new Blob([buffer]);
-                    bitmap = await createImageBitmap(blob);
-                    self.postMessage({ type: 'progress', percent: 30 });
-                    
-                    canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-                    ctx = canvas.getContext("2d", { 
-                        alpha: true, 
-                        desynchronized: true
-                    });
-                    
-                    ctx.imageSmoothingEnabled = false;
-                    ctx.drawImage(bitmap, 0, 0);
-                    self.postMessage({ type: 'progress', percent: 50 });
-                    
-                    // Free raw bitmap immediately after drawing to save memory
-                    bitmap.close();
-                    bitmap = null;
-
-                    if (mode === 'optimized') {
-                        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-                        self.postMessage({ type: 'progress', percent: 70 });
-                        finalBuffer = UPNG.encode([imageData.buffer], canvas.width, canvas.height, 256);
-                    } else {
-                        self.postMessage({ type: 'progress', percent: 60 });
+        for (let i = 0; i < numWorkers; i++) {
+            const workerCode = `
+                const window = self;
+                const global = self;
+                ${pakoCode}
+                ${upngCode}
+                
+                self.onmessage = async (e) => {
+                    try {
+                        const { buffer, mode } = e.data;
+                        self.postMessage({ type: 'progress', percent: 10 });
+                        // Convert buffer back to blob for bitmap
+                        const blob = new Blob([buffer]);
+                        const bitmap = await createImageBitmap(blob);
+                        self.postMessage({ type: 'progress', percent: 30 });
                         
-                        // 🚀 MEMORY FIX: Transfer image out of canvas before converting to blob.
-                        // This prevents holding raw pixel buffers and blobs in RAM at the same time.
-                        const imageBitmap = canvas.transferToImageBitmap();
+                        const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+                        const ctx = canvas.getContext("2d", { 
+                            alpha: true, 
+                            desynchronized: true // 🔥 DEEP OPTIMIZATION: Reduces latency
+                        });
                         
-                        // Shrink canvas immediately to release GPU allocation
+                        ctx.imageSmoothingEnabled = false; // 🔥 Speed up draw
+                        ctx.drawImage(bitmap, 0, 0);
+                        self.postMessage({ type: 'progress', percent: 50 });
+                        
+                        let finalBuffer;
+                        if (mode === 'optimized') {
+                            const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height).data;
+                            self.postMessage({ type: 'progress', percent: 70 });
+                            finalBuffer = UPNG.encode([imageData.buffer], bitmap.width, bitmap.height, 256);
+                        } else {
+                            self.postMessage({ type: 'progress', percent: 60 });
+                            const finalBlob = await canvas.convertToBlob({ type: "image/png" });
+                            self.postMessage({ type: 'progress', percent: 80 });
+                            finalBuffer = await finalBlob.arrayBuffer();
+                        }
+
+                        bitmap.close();
                         ctx.clearRect(0, 0, canvas.width, canvas.height);
                         canvas.width = 1;
                         canvas.height = 1;
-                        
-                        self.postMessage({ type: 'progress', percent: 70 });
-                        
-                        const finalBlob = await imageBitmap.convertToBlob({ type: "image/png" });
-                        imageBitmap.close(); // Clean up intermediate bitmap memory
-                        
-                        self.postMessage({ type: 'progress', percent: 80 });
-                        finalBuffer = await finalBlob.arrayBuffer();
+
+                        self.postMessage({ type: 'progress', percent: 100 });
+                        self.postMessage({ buffer: finalBuffer }, [finalBuffer]);
+
+                    } catch (err) {
+                        self.postMessage({ error: err.message });
                     }
-
-                    // Aggressive clean up of the main context if not cleared in step above
-                    if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    if (canvas) {
-                        canvas.width = 1;
-                        canvas.height = 1;
-                    }
-
-                    self.postMessage({ type: 'progress', percent: 100 });
-                    self.postMessage({ buffer: finalBuffer }, [finalBuffer]);
-
-                } catch (err) {
-                    self.postMessage({ error: err.message });
-                } finally {
-                    // Force dereference everything for Garbage Collection
-                    bitmap = null;
-                    canvas = null;
-                    ctx = null;
-                    finalBuffer = null;
-                }
-            };
-        `;
-
-        for (let i = 0; i < numWorkers; i++) {
+                };
+            `;
             const workerUrl = URL.createObjectURL(new Blob([workerCode], { type: "application/javascript" }));
             const worker = new Worker(workerUrl);
             URL.revokeObjectURL(workerUrl);
             jpgPngWorkers.push(worker);
         }
-        
-        jpgWorkerIndex = 0;
         console.log("Converter Engine Ready.");
     } catch (err) {
         console.error("Failed to start converter:", err);
@@ -778,19 +915,25 @@ function convertJpgToPngSimple(jpgBlob, fileIndex) {
             const worker = jpgPngWorkers[jpgWorkerIndex];
             jpgWorkerIndex = (jpgWorkerIndex + 1) % jpgPngWorkers.length;
 
-            worker.onmessage = (e) => {
+            // We use a unique function name so we can remove it cleanly when done
+            const handleWorkerMessage = (e) => {
                 if (e.data.type === 'progress') {
+                    // Update progress using the locked fileIndex
                     updateProgress(fileIndex, e.data.percent);
                 } else if (e.data?.error) {
+                    worker.removeEventListener('message', handleWorkerMessage); // Clean up!
                     reject(e.data.error);
-                } else {
+                } else if (e.data && e.data.buffer) {
+                    worker.removeEventListener('message', handleWorkerMessage); // Clean up!
                     const blob = new Blob([e.data.buffer], { type: 'image/png' });
                     resolve(blob);
                 }
             };
 
-            // 🔥 TRANSFERABLE: Use the second argument to transfer the buffer
-            // This makes the data disappear from the Main Thread and appear in the Worker
+            // 🔥 FIX: Use addEventListener instead of overwriting .onmessage
+            worker.addEventListener('message', handleWorkerMessage);
+
+            // 🔥 TRANSFERABLE: Pass the buffer to the worker
             worker.postMessage({ 
                 buffer: arrayBuffer, 
                 mode: window.qualityMode 
@@ -805,6 +948,13 @@ function convertJpgToPngSimple(jpgBlob, fileIndex) {
 
 // ============ CONVERT SINGLE FILE (STANDALONE) ============
 async function convertSingleFileStandalone(index) {
+    // 🛡️ THE THUMBNAIL GUARD
+    const guard = document.getElementById('thumbGuard');
+    if (pendingThumbnails > 0) {
+        if (guard) guard.style.display = 'flex';
+        await waitForThumbnails(); 
+        if (guard) guard.style.display = 'none';
+    }
     // 1. Force reset if a previous batch was cancelled/hidden
     const modal = document.getElementById('progressModal');
     const isModalVisible = modal && modal.style.display === 'flex';
