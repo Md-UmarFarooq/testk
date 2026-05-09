@@ -1628,3 +1628,35 @@ input, select {
     margin: 0 auto;
     animation: spin 0.8s linear infinite;
 }
+
+#thumbGuard {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: rgba(0, 0, 0, 0.7); /* Smooth dim overlay */
+    backdrop-filter: blur(4px);      /* Subtle glass blur */
+    z-index: 9999;                  /* Make sure it's on top of everything */
+    display: none;                  /* Managed by JS (flex when visible) */
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    color: #fff;
+    font-family: sans-serif;
+}
+
+.guard-spinner {
+    width: 50px;
+    height: 50px;
+    border: 5px solid #333;
+    border-top: 5px solid #ff7b00; /* Your orange theme brand color */
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin-bottom: 15px;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
