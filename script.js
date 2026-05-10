@@ -700,8 +700,8 @@ window.qualityMode = 'best'; // Global source of truth
 async function initConverter() {
     try {
         const [upngRes, pakoRes] = await Promise.all([
-            fetch('/jpg-to-png/upng.js'),
-            fetch('/jpg-to-png/pako.js')
+            fetch('upng.js'),
+            fetch('pako.js')
         ]);
         const upngCode = await upngRes.text();
         const pakoCode = await pakoRes.text();
