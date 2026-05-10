@@ -517,134 +517,50 @@ function getConcurrencyLimit(file) {
 }
 
 // ============ MAIN CONVERSION FUNCTIONS ============
-async function startBatchConversion() {
-    // 🛡️ THE THUMBNAIL GUARD
-    const guard = document.getElementById('thumbGuard');
-    if (pendingThumbnails > 0) {
-        if (guard) guard.style.display = 'flex';
-        await waitForThumbnails(); 
-        if (guard) guard.style.display = 'none';
-    }
-    if (selectedFiles.length === 0) { showError('Please select files first'); return; }
-
-    const allDone = selectedFiles.every((_, i) => 
-        conversionResults[i] && conversionResults[i].status === 'success'
-    );
-    if (allDone) { showMessage('All files are already converted! ✨'); return; }
-    if (isConverting) return;
-
-    // Ensure all weights are ready so the denominator isn't zero
-    await Promise.all(selectedFiles.map(f => getFileWeight(f)));
+function updateProgress(fileIndex, internalFilePercent = 100) {
+    const total = selectedFiles.length;
+    const file = selectedFiles[fileIndex];
     
-    totalPixelsInBatch = selectedFiles.reduce((acc, f) => acc + (f.pixelWeight || 0), 0);
-    fileContributions = {};
-    isConverting = true;
-    showProgressModal(); 
+    if (!file) return;
 
-    // If files were already converted (standalone), add them to bar NOW
-    selectedFiles.forEach((f, i) => {
-        if (conversionResults[i] && conversionResults[i].status === 'success') {
-            fileContributions[i] = f.pixelWeight;
-        }
-    });
-
-    // Update targets immediately so the bar doesn't "jump" later
-    targetPixels = Object.values(fileContributions).reduce((a, b) => a + b, 0);
-    targetPercent = totalPixelsInBatch > 0 ? (targetPixels / totalPixelsInBatch) * 100 : 0;
-    currentDisplayPercent = targetPercent; 
-
-    const convertBtn = document.getElementById('convertBtn');
-    if (convertBtn) {
-        convertBtn.disabled = true;
-        convertBtn.textContent = 'Processing...';
+    // 🔥 FIX: Use filename as key for fileContributions
+    if (file && file.pixelWeight) {
+        const pixelsDoneForThisFile = (internalFilePercent / 100) * file.pixelWeight;
+        fileContributions[file.name] = pixelsDoneForThisFile;
     }
 
-    // =========================================================
-    // 🔥 MOBILE PAINT-YIELDING CONCURRENCY QUEUE ENGINE
-    // =========================================================
+    const totalPixelsDone = Object.values(fileContributions).reduce((a, b) => a + b, 0);
+    targetPixels = totalPixelsDone;
     
-    // Gather all file indices that actually need conversion
-    const pendingIndices = [];
-    selectedFiles.forEach((_, i) => {
-        if (!conversionResults[i] || conversionResults[i].status !== 'success') {
-            pendingIndices.push(i);
-        }
-    });
+    targetPercent = totalPixelsInBatch > 0
+        ? Math.min((totalPixelsDone / totalPixelsInBatch) * 100, 100)
+        : 0;
+    
+    if (!animationFrame) {
+        animatePixelCounter();
+    }
 
-    let queueIndex = 0;        
-    let activeWorkerCount = 0;  
+    // Update the conversion stats UI
+    const completed = Object.values(conversionResults).filter(r => r && r.status === 'success').length;
+    const failed = Object.values(conversionResults).filter(r => r && r.status === 'failed').length;
+    
+    if (document.getElementById('completedCount')) 
+        document.getElementById('completedCount').textContent = completed;
+    if (document.getElementById('failedCount')) 
+        document.getElementById('failedCount').textContent = failed;
+    if (document.getElementById('remainingCount')) 
+        document.getElementById('remainingCount').textContent = total - (completed + failed);
 
-    // Helper to yield control back to the browser for rendering (solves mobile freeze)
-    const yieldToMainThread = () => new Promise(resolve => setTimeout(resolve, 30));
-
-    // This promise resolves once the entire batch finishes processing
-    await new Promise((resolveBatch) => {
-        
-        // Recursive worker runner
-        function runNext() {
-            if (queueIndex >= pendingIndices.length || !isConverting) {
-                if (activeWorkerCount === 0) {
-                    resolveBatch();
-                }
-                return;
+    if (!downloadBtnVisible) {
+        const hasSuccess = Object.values(conversionResults).some(r => r && r.status === 'success');
+        if (hasSuccess) {
+            const downloadAllBtn = document.getElementById('downloadBtn');
+            if (downloadAllBtn) {
+                downloadAllBtn.style.display = 'block';
+                downloadBtnVisible = true; 
             }
-
-            const targetIndex = pendingIndices[queueIndex++];
-            activeWorkerCount++;
-
-            // NON-BLOCKING TRIGGER
-            convertSingleFile(targetIndex).then(async () => {
-                
-                // 🛑 CRITICAL MOBILE FIX: Force the JS engine to pause and yield to the main thread.
-                // This gives requestAnimationFrame a window to paint the progress bar on mobile screens.
-                await yieldToMainThread(); 
-                
-                activeWorkerCount--;
-
-                if (!isConverting) {
-                    if (activeWorkerCount === 0) resolveBatch();
-                    return;
-                }
-
-                // Look ahead to check dynamic limits for the next file in the queue
-                const nextFileIndex = pendingIndices[queueIndex];
-                const nextFile = selectedFiles[nextFileIndex];
-                const allowedConcurrency = nextFile ? getConcurrencyLimit(nextFile) : 1;
-
-                // Spawn additional parallel runners if load capacity allows it
-                while (activeWorkerCount < allowedConcurrency && queueIndex < pendingIndices.length && isConverting) {
-                    runNext();
-                }
-
-                // If queue is exhausted and all active threads are complete
-                if (activeWorkerCount === 0 && queueIndex >= pendingIndices.length) {
-                    resolveBatch();
-                }
-            }).catch(err => {
-                console.error("Queue execution step failed:", err);
-                activeWorkerCount--;
-                
-                // Jump to next file immediately on unexpected failure so queue doesn't lock up
-                runNext(); 
-            });
         }
-
-        // Kickstart the initial parallel processing threads
-        const firstFile = selectedFiles[pendingIndices[0]];
-        const initialConcurrencyCeiling = firstFile ? getConcurrencyLimit(firstFile) : 1;
-        const initialSpawns = Math.min(initialConcurrencyCeiling, pendingIndices.length);
-
-        for (let i = 0; i < initialSpawns; i++) {
-            if (!isConverting) break;
-            runNext();
-        }
-
-        if (pendingIndices.length === 0) {
-            resolveBatch();
-        }
-    });
-
-    finalizeConversion();
+    }
 }
 
 async function convertSingleFile(index) {
