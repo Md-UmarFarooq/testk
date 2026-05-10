@@ -511,15 +511,21 @@ async function startBatchConversion() {
     if (allDone) { showMessage('All files are already converted! ✨'); return; }
     if (isConverting) return;
 
-    // 🔥 FIX 1: Ensure all weights are ready so the denominator isn't zero
-    await Promise.all(selectedFiles.map(f => getFileWeight(f)));
+    // 🔥 FIX: Reuse already-calculated weights. 
+    // Fall back to a fast, non-blocking size estimation only if missing.
+    selectedFiles.forEach(f => {
+        if (!f.pixelWeight) {
+            // Rapid estimation (1 byte ≈ 1.5 pixels) with 100k px minimum
+            f.pixelWeight = Math.max(100000, f.size * 1.5); 
+        }
+    });
     
     totalPixelsInBatch = selectedFiles.reduce((acc, f) => acc + (f.pixelWeight || 0), 0);
     fileContributions = {};
     isConverting = true;
     showProgressModal(); 
 
-    // 🔥 FIX 2: If files were already converted (standalone), add them to bar NOW
+    // 🔥 If files were already converted (standalone), add them to bar NOW
     selectedFiles.forEach((f, i) => {
         if (conversionResults[i] && conversionResults[i].status === 'success') {
             fileContributions[i] = f.pixelWeight;
@@ -538,7 +544,7 @@ async function startBatchConversion() {
     }
 
     // =========================================================
-    // 🔥 MATRIX-DRIVEN SLIDING CONCURRENCY QUEUE ENGINE (FIXED)
+    // 🔥 MATRIX-DRIVEN SLIDING CONCURRENCY QUEUE ENGINE
     // =========================================================
     
     // Gather all file indices that actually need conversion
@@ -568,11 +574,10 @@ async function startBatchConversion() {
             const targetIndex = pendingIndices[queueIndex++];
             activeWorkerCount++;
 
-            // 🔥 NON-BLOCKING TRIGGER: Starts conversion and registers callbacks 
-            // without blocking the main execution of runNext loop.
+            // 🔥 NON-BLOCKING TRIGGER: Starts conversion and registers callbacks
             convertSingleFile(targetIndex).then(async () => {
                 // Allow a brief 50ms breather for DOM rendering and Garbage Collection
-                await new Promise(r => setTimeout(r, 200));
+                await new Promise(r => setTimeout(r, 50)); 
                 
                 activeWorkerCount--;
 
@@ -659,13 +664,13 @@ async function convertSingleFile(index) {
         // Update UI at the CORRECT current index
         updateFileCardStatus(currentIndex, 'completed');
         
-        // Update progress
+        // Update progress using the correct real-time index
         updateProgress(currentIndex, 100);
         
     } catch (error) {
         console.error('Conversion failed:', error);
         
-        // FIX: Also find index for error case
+        // FIX: Find correct dynamic index for error case too
         const currentIndex = selectedFiles.findIndex(f => f.name === originalFileName);
         if (currentIndex !== -1) {
             conversionResults[currentIndex] = {
@@ -673,10 +678,12 @@ async function convertSingleFile(index) {
                 status: 'failed'
             };
             updateFileCardStatus(currentIndex, 'failed');
+            
+            // Pass the correct real-time index to updateProgress
+            updateProgress(currentIndex, 100);
+        } else {
+            updateProgress(index, 100);
         }
-        
-        // Update progress
-        updateProgress(index, 100);
     }
 }
 
