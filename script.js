@@ -399,8 +399,9 @@ function updateFileCardStatus(index, status) {
     }
 }
 
-// ============ MAIN CONVERSION FUNCTIONS ============
-// ============ DEVICE & CONCURRENCY CLASSIFIER ============
+// =========================================================
+// 🔒 LOCKED MASTER CONCURRENCY TABLE & HARDWARE DETECTION
+// =========================================================
 
 /**
  * Robustly detects device type: 'desktop', 'tablet', or 'mobile'
@@ -410,7 +411,6 @@ function getDeviceProfile() {
     const isMobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
     
     if (isMobileUA) {
-        // Check if it's a tablet based on screen width/height metrics
         const maxDimension = Math.max(screen.width, screen.height);
         const isTabletUA = /(ipad|tablet|playbook|silk)|(android(?!.*mobile))/i.test(ua);
         
@@ -420,7 +420,6 @@ function getDeviceProfile() {
         return 'mobile';
     }
     
-    // Fallback detection for newer iPads that present as Desktop Safari
     const isIPadOS = (navigator.maxTouchPoints && navigator.maxTouchPoints > 2 && /Macintosh/.test(ua));
     if (isIPadOS) {
         return 'tablet';
@@ -430,65 +429,69 @@ function getDeviceProfile() {
 }
 
 /**
- * Computes exact concurrency limit based on your production matrix
+ * Evaluates the concurrency limit for a file dynamically based on its pixel density,
+ * current quality setting, device profiles, and hardware traits.
  */
 function getConcurrencyLimit(file) {
-    if (!file || !file.pixelWeight) return 1; // Fallback
+    if (!file || !file.pixelWeight) return 1;
 
     const pixels = file.pixelWeight;
     const device = getDeviceProfile();
     const mode = window.qualityMode || 'best';
     
-    // Fallback to 4GB if API is unsupported (like on Firefox/Safari)
+    // Fallback detection (deviceMemory caps at 8)
     const ram = navigator.deviceMemory || 4; 
+    const cores = navigator.hardwareConcurrency || 4;
 
-    // ==========================================
-    // 1. DESKTOP / LAPTOP PROFILE
-    // ==========================================
+    // 1. DESKTOP PROFILE
     if (device === 'desktop') {
         if (mode === 'best') {
-            if (pixels <= 2000000)  return ram <= 4 ? 2 : (ram <= 8 ? 3 : 4); // ≤ 2MP
-            if (pixels <= 4000000)  return ram <= 4 ? 2 : (ram <= 8 ? 3 : 3); // ≤ 4MP
-            if (pixels <= 8000000)  return ram <= 4 ? 1 : (ram <= 8 ? 2 : 2); // ≤ 8MP
-            if (pixels <= 12000000) return ram <= 4 ? 1 : (ram <= 8 ? 2 : 2); // ≤ 12MP
-            return 1; // > 12MP (≤24MP and >24MP are strictly 1)
+            if (pixels <= 1000000)  return ram <= 4 ? 3 : (cores <= 4 ? 4 : (cores <= 8 ? 5 : 6));
+            if (pixels <= 2000000)  return ram <= 4 ? 2 : (cores <= 4 ? 3 : (cores <= 8 ? 4 : Math.min(cores - 1, 6)));
+            if (pixels <= 4000000)  return ram <= 4 ? 2 : (cores <= 4 ? 2 : (cores <= 8 ? 3 : Math.min(cores - 2, 5)));
+            if (pixels <= 8000000)  return ram <= 4 ? 1 : (cores <= 4 ? 2 : (cores <= 8 ? 2 : 3));
+            if (pixels <= 12000000) return ram <= 4 ? 1 : (cores <= 4 ? 1 : (cores <= 8 ? 2 : 2));
+            if (pixels <= 24000000) return ram <= 4 ? 1 : (cores <= 4 ? 1 : (cores <= 8 ? 1 : 2));
+            return 1; // > 24MP
         } else {
-            // 'optimized'
-            if (pixels <= 2000000)  return ram <= 4 ? 1 : (ram <= 8 ? 2 : 3); // ≤ 2MP
-            if (pixels <= 4000000)  return ram <= 4 ? 1 : (ram <= 8 ? 2 : 2); // ≤ 4MP
-            return 1; // > 4MP (≤8MP, ≤12MP, ≤24MP, >24MP are strictly 1)
+            // Optimized Mode (UPNG)
+            if (pixels <= 1000000)  return ram <= 4 ? 2 : (cores <= 4 ? 3 : (cores <= 8 ? 4 : 5));
+            if (pixels <= 2000000)  return ram <= 4 ? 1 : (cores <= 4 ? 2 : (cores <= 8 ? 3 : Math.min(cores - 2, 4)));
+            if (pixels <= 4000000)  return ram <= 4 ? 1 : (cores <= 4 ? 1 : (cores <= 8 ? 2 : Math.min(cores - 3, 3)));
+            if (pixels <= 8000000)  return ram <= 4 ? 1 : (cores <= 4 ? 1 : (cores <= 8 ? 1 : 2));
+            if (pixels <= 12000000) return 1;
+            if (pixels <= 24000000) return 1;
+            return 1; // > 24MP
         }
     }
 
-    // ==========================================
     // 2. TABLET PROFILE
-    // ==========================================
     if (device === 'tablet') {
         if (mode === 'best') {
-            if (pixels <= 2000000) return ram <= 4 ? 2 : 3; // ≤ 2MP
-            if (pixels <= 4000000) return ram <= 4 ? 1 : 2; // ≤ 4MP
-            return 1; // > 4MP (≤8MP and >8MP are strictly 1)
+            if (pixels <= 1000000) return ram <= 4 ? 3 : 4;
+            if (pixels <= 2000000) return ram <= 4 ? 2 : 3;
+            if (pixels <= 4000000) return ram <= 4 ? 1 : 2;
+            return 1; // > 4MP
         } else {
-            // 'optimized' (Any RAM: 1)
-            return 1;
+            return 1; // Always 1 for tablet optimized mode
         }
     }
 
-    // ==========================================
-    // 3. MOBILE PHONE PROFILE
-    // ==========================================
+    // 3. MOBILE PROFILE
     if (device === 'mobile') {
         if (mode === 'best') {
-            if (pixels <= 2000000) return ram <= 4 ? 1 : 2; // ≤ 2MP
-            if (pixels <= 4000000) return ram <= 4 ? 1 : 2; // ≤ 4MP
-            return 1; // > 4MP (≤8MP and >8MP are strictly 1)
+            if (pixels <= 1000000) return ram <= 4 ? 2 : 3;
+            if (pixels <= 2000000) return ram <= 4 ? 1 : 2;
+            if (pixels <= 4000000) {
+                return (ram > 4 && cores >= 6) ? 2 : 1;
+            }
+            return 1; // > 4MP
         } else {
-            // 'optimized' (Any RAM: 1)
-            return 1;
+            return 1; // Always 1 for mobile optimized mode
         }
     }
 
-    return 1; // Ultimate failsafe fallback
+    return 1;
 }
 
 // ============ MAIN CONVERSION FUNCTIONS ============
@@ -508,7 +511,7 @@ async function startBatchConversion() {
     if (allDone) { showMessage('All files are already converted! ✨'); return; }
     if (isConverting) return;
 
-    // Ensure all weights are ready so the denominator isn't zero
+    // 🔥 FIX 1: Ensure all weights are ready so the denominator isn't zero
     await Promise.all(selectedFiles.map(f => getFileWeight(f)));
     
     totalPixelsInBatch = selectedFiles.reduce((acc, f) => acc + (f.pixelWeight || 0), 0);
@@ -516,7 +519,7 @@ async function startBatchConversion() {
     isConverting = true;
     showProgressModal(); 
 
-    // If files were already converted (standalone), add them to bar NOW
+    // 🔥 FIX 2: If files were already converted (standalone), add them to bar NOW
     selectedFiles.forEach((f, i) => {
         if (conversionResults[i] && conversionResults[i].status === 'success') {
             fileContributions[i] = f.pixelWeight;
@@ -535,7 +538,7 @@ async function startBatchConversion() {
     }
 
     // =========================================================
-    // 🔥 MATRIX-DRIVEN SLIDING CONCURRENCY QUEUE ENGINE
+    // 🔥 MATRIX-DRIVEN SLIDING CONCURRENCY QUEUE ENGINE (FIXED)
     // =========================================================
     
     // Gather all file indices that actually need conversion
@@ -553,41 +556,52 @@ async function startBatchConversion() {
     await new Promise((resolveBatch) => {
         
         // Recursive worker runner
-        async function runNext() {
+        function runNext() {
             if (queueIndex >= pendingIndices.length || !isConverting) {
+                // If queue is exhausted and no active workers are running, finish
+                if (activeWorkerCount === 0) {
+                    resolveBatch();
+                }
                 return;
             }
 
             const targetIndex = pendingIndices[queueIndex++];
             activeWorkerCount++;
 
-            // Run conversion process for this file
-            await convertSingleFile(targetIndex);
-            
-            // Allow a brief 50ms breather for DOM rendering and Garbage Collection
-            await new Promise(r => setTimeout(r, 50)); 
-            
-            activeWorkerCount--;
+            // 🔥 NON-BLOCKING TRIGGER: Starts conversion and registers callbacks 
+            // without blocking the main execution of runNext loop.
+            convertSingleFile(targetIndex).then(async () => {
+                // Allow a brief 50ms breather for DOM rendering and Garbage Collection
+                await new Promise(r => setTimeout(r, 50)); 
+                
+                activeWorkerCount--;
 
-            if (!isConverting) {
-                if (activeWorkerCount === 0) resolveBatch();
-                return;
-            }
+                if (!isConverting) {
+                    if (activeWorkerCount === 0) resolveBatch();
+                    return;
+                }
 
-            // Look ahead to check dynamic limits for the next file in the queue
-            const nextFileIndex = pendingIndices[queueIndex];
-            const nextFile = selectedFiles[nextFileIndex];
-            const allowedConcurrency = nextFile ? getConcurrencyLimit(nextFile) : 1;
+                // Look ahead to check dynamic limits for the next file in the queue
+                const nextFileIndex = pendingIndices[queueIndex];
+                const nextFile = selectedFiles[nextFileIndex];
+                const allowedConcurrency = nextFile ? getConcurrencyLimit(nextFile) : 1;
 
-            // Spawn additional parallel runners if our load capacity allows it
-            while (activeWorkerCount < allowedConcurrency && queueIndex < pendingIndices.length && isConverting) {
-                runNext();
-            }
+                // Spawn additional parallel runners if our hardware load capacity allows it
+                while (activeWorkerCount < allowedConcurrency && queueIndex < pendingIndices.length && isConverting) {
+                    runNext();
+                }
 
-            // If queue is exhausted and all active threads are complete
-            if (activeWorkerCount === 0 && queueIndex >= pendingIndices.length) {
-                resolveBatch();
-            }
+                // Final safety check to resolve when queue runs completely dry
+                if (activeWorkerCount === 0 && queueIndex >= pendingIndices.length) {
+                    resolveBatch();
+                }
+            }).catch(err => {
+                console.error("Queue execution step failed:", err);
+                activeWorkerCount--;
+                
+                // Jump to next file immediately on unexpected failure so queue doesn't lock up
+                runNext(); 
+            });
         }
 
         // Kickstart the initial parallel processing threads
@@ -646,7 +660,7 @@ async function convertSingleFile(index) {
         updateFileCardStatus(currentIndex, 'completed');
         
         // Update progress
-        updateProgress(index, 100);
+        updateProgress(currentIndex, 100);
         
     } catch (error) {
         console.error('Conversion failed:', error);
@@ -915,25 +929,19 @@ function convertJpgToPngSimple(jpgBlob, fileIndex) {
             const worker = jpgPngWorkers[jpgWorkerIndex];
             jpgWorkerIndex = (jpgWorkerIndex + 1) % jpgPngWorkers.length;
 
-            // We use a unique function name so we can remove it cleanly when done
-            const handleWorkerMessage = (e) => {
+            worker.onmessage = (e) => {
                 if (e.data.type === 'progress') {
-                    // Update progress using the locked fileIndex
                     updateProgress(fileIndex, e.data.percent);
                 } else if (e.data?.error) {
-                    worker.removeEventListener('message', handleWorkerMessage); // Clean up!
                     reject(e.data.error);
-                } else if (e.data && e.data.buffer) {
-                    worker.removeEventListener('message', handleWorkerMessage); // Clean up!
+                } else {
                     const blob = new Blob([e.data.buffer], { type: 'image/png' });
                     resolve(blob);
                 }
             };
 
-            // 🔥 FIX: Use addEventListener instead of overwriting .onmessage
-            worker.addEventListener('message', handleWorkerMessage);
-
-            // 🔥 TRANSFERABLE: Pass the buffer to the worker
+            // 🔥 TRANSFERABLE: Use the second argument to transfer the buffer
+            // This makes the data disappear from the Main Thread and appear in the Worker
             worker.postMessage({ 
                 buffer: arrayBuffer, 
                 mode: window.qualityMode 
