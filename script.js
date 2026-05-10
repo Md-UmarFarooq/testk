@@ -511,7 +511,7 @@ async function startBatchConversion() {
     if (allDone) { showMessage('All files are already converted! ✨'); return; }
     if (isConverting) return;
 
-    // 🔥 FIX 1: Ensure all weights are ready so the denominator isn't zero
+    // Ensure all weights are ready so the denominator isn't zero
     await Promise.all(selectedFiles.map(f => getFileWeight(f)));
     
     totalPixelsInBatch = selectedFiles.reduce((acc, f) => acc + (f.pixelWeight || 0), 0);
@@ -519,7 +519,7 @@ async function startBatchConversion() {
     isConverting = true;
     showProgressModal(); 
 
-    // 🔥 FIX 2: If files were already converted (standalone), add them to bar NOW
+    // If files were already converted (standalone), add them to bar NOW
     selectedFiles.forEach((f, i) => {
         if (conversionResults[i] && conversionResults[i].status === 'success') {
             fileContributions[i] = f.pixelWeight;
@@ -538,7 +538,7 @@ async function startBatchConversion() {
     }
 
     // =========================================================
-    // 🔥 MATRIX-DRIVEN SLIDING CONCURRENCY QUEUE ENGINE (FIXED)
+    // 🔥 MOBILE PAINT-YIELDING CONCURRENCY QUEUE ENGINE
     // =========================================================
     
     // Gather all file indices that actually need conversion
@@ -552,13 +552,15 @@ async function startBatchConversion() {
     let queueIndex = 0;        
     let activeWorkerCount = 0;  
 
+    // Helper to yield control back to the browser for rendering (solves mobile freeze)
+    const yieldToMainThread = () => new Promise(resolve => setTimeout(resolve, 30));
+
     // This promise resolves once the entire batch finishes processing
     await new Promise((resolveBatch) => {
         
         // Recursive worker runner
         function runNext() {
             if (queueIndex >= pendingIndices.length || !isConverting) {
-                // If queue is exhausted and no active workers are running, finish
                 if (activeWorkerCount === 0) {
                     resolveBatch();
                 }
@@ -568,11 +570,12 @@ async function startBatchConversion() {
             const targetIndex = pendingIndices[queueIndex++];
             activeWorkerCount++;
 
-            // 🔥 NON-BLOCKING TRIGGER: Starts conversion and registers callbacks 
-            // without blocking the main execution of runNext loop.
+            // NON-BLOCKING TRIGGER
             convertSingleFile(targetIndex).then(async () => {
-                // Allow a brief 50ms breather for DOM rendering and Garbage Collection
-                await new Promise(r => setTimeout(r, 50)); 
+                
+                // 🛑 CRITICAL MOBILE FIX: Force the JS engine to pause and yield to the main thread.
+                // This gives requestAnimationFrame a window to paint the progress bar on mobile screens.
+                await yieldToMainThread(); 
                 
                 activeWorkerCount--;
 
@@ -586,12 +589,12 @@ async function startBatchConversion() {
                 const nextFile = selectedFiles[nextFileIndex];
                 const allowedConcurrency = nextFile ? getConcurrencyLimit(nextFile) : 1;
 
-                // Spawn additional parallel runners if our hardware load capacity allows it
+                // Spawn additional parallel runners if load capacity allows it
                 while (activeWorkerCount < allowedConcurrency && queueIndex < pendingIndices.length && isConverting) {
                     runNext();
                 }
 
-                // Final safety check to resolve when queue runs completely dry
+                // If queue is exhausted and all active threads are complete
                 if (activeWorkerCount === 0 && queueIndex >= pendingIndices.length) {
                     resolveBatch();
                 }
