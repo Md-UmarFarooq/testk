@@ -115,20 +115,42 @@ function handleFileSelect(event, fileInput) {
     fileInput.value = ''; // Reset input
 }
 
-async function getFileWeight(file) {
-    if (file.pixelWeight) return file.pixelWeight;
-    return new Promise(resolve => {
+function getFileWeight(file) {
+    // If we already calculated the weight, resolve immediately
+    if (file.pixelWeight) return Promise.resolve(file.pixelWeight);
+
+    // Create a promise that actually loads the image to get real dimensions
+    const getRealDimensions = new Promise((resolve) => {
+        const url = URL.createObjectURL(file);
         const img = new Image();
+        
         img.onload = () => {
-            file.pixelWeight = img.width * img.height;
-            URL.revokeObjectURL(img.src);
-            resolve(file.pixelWeight);
+            const pixels = img.naturalWidth * img.naturalHeight;
+            URL.revokeObjectURL(url);
+            resolve(pixels);
         };
+        
         img.onerror = () => {
-            file.pixelWeight = 1000000; // Fallback for corrupt files
-            resolve(1000000);
+            URL.revokeObjectURL(url);
+            resolve(0); // Fallback on load error
         };
-        img.src = URL.createObjectURL(file);
+        
+        img.src = url;
+    });
+
+    // Create a fast timeout promise (e.g., 250ms) to prevent mobile hanging
+    const timeoutFallback = new Promise((resolve) => {
+        setTimeout(() => {
+            // ESTIMATION MATH: Estimate pixels based on file size (approx 1 byte ≈ 1.5 pixels for compressed JPEGs)
+            const estimatedPixels = Math.max(100000, file.size * 1.5); 
+            resolve(estimatedPixels);
+        }, 250); // 250ms threshold
+    });
+
+    // Race them! Whichever finishes first wins.
+    return Promise.race([getRealDimensions, timeoutFallback]).then((weight) => {
+        file.pixelWeight = weight;
+        return weight;
     });
 }
 
