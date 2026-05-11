@@ -399,7 +399,7 @@ function updateFileCardStatus(index, status) {
     }
 }
 
-// ============ MAIN CONVERSION FUNCTIONS ============
+// ============ NEW GLOBAL CONCURRENCY TRACKER ============
 let activeConversions = new Set(); // Tracks currently running file indices
 
 // ============ DEVICE & CONCURRENCY PROFILE ============
@@ -491,7 +491,7 @@ function getConcurrencyLimit(file) {
     return 1;
 }
 
-// ============ REPLACED BATCH CONVERSION SCHEDULER ============
+// ============ MAIN CONVERSION FUNCTIONS ============
 async function startBatchConversion() {
     // 🛡️ THE THUMBNAIL GUARD
     const guard = document.getElementById('thumbGuard');
@@ -509,22 +509,23 @@ async function startBatchConversion() {
     if (allDone) { showMessage('All files are already converted! ✨'); return; }
     if (isConverting) return;
 
-    // Use your exact pre-calculated file contributions & weights (no recalculations)
+    // Ensure all weights are pre-calculated so the denominator isn't zero
     await Promise.all(selectedFiles.map(f => getFileWeight(f)));
     
     totalPixelsInBatch = selectedFiles.reduce((acc, f) => acc + (f.pixelWeight || 0), 0);
     fileContributions = {};
     isConverting = true;
-    activeConversions.clear();
+    activeConversions.clear(); // Clear local concurrency set
     showProgressModal(); 
 
-    // Sync already converted items (standalone)
+    // If files were already converted (standalone), add them to bar NOW
     selectedFiles.forEach((f, i) => {
         if (conversionResults[i] && conversionResults[i].status === 'success') {
             fileContributions[i] = f.pixelWeight;
         }
     });
 
+    // Update targets immediately so the bar doesn't "jump" later
     targetPixels = Object.values(fileContributions).reduce((a, b) => a + b, 0);
     targetPercent = totalPixelsInBatch > 0 ? (targetPixels / totalPixelsInBatch) * 100 : 0;
     currentDisplayPercent = targetPercent; 
@@ -536,7 +537,6 @@ async function startBatchConversion() {
     }
 
     // --- PARALLEL SCHEDULER IMPLEMENTATION ---
-    let completedCount = 0;
     const totalFiles = selectedFiles.length;
 
     return new Promise((resolve) => {
@@ -548,7 +548,7 @@ async function startBatchConversion() {
             }
 
             // Determine current pool safety ceiling based on active tasks
-            let currentAllowedLimit = 6; // Default ceiling
+            let currentAllowedLimit = 6; 
             activeConversions.forEach(idx => {
                 const limit = getConcurrencyLimit(selectedFiles[idx]);
                 if (limit < currentAllowedLimit) {
@@ -560,7 +560,7 @@ async function startBatchConversion() {
             while (isConverting && activeConversions.size < currentAllowedLimit) {
                 let foundTask = false;
 
-                // Look for the next files that fit our current capability profile
+                // Look for the next files that fit our capability profile
                 for (let i = 0; i < totalFiles; i++) {
                     // Skip if already converting, failed, or successfully completed
                     if (activeConversions.has(i)) continue;
@@ -569,8 +569,7 @@ async function startBatchConversion() {
                     const fileLimit = getConcurrencyLimit(selectedFiles[i]);
 
                     // Fast-lane skip check:
-                    // If we are currently running high-concurrency tasks, don't block
-                    // them unless this is the only remaining file to do.
+                    // If we are currently running high-concurrency tasks, don't block them unless this is the only remaining file.
                     if (fileLimit < currentAllowedLimit && activeConversions.size > 0) {
                         continue; 
                     }
@@ -585,9 +584,8 @@ async function startBatchConversion() {
                     // Execute conversion asynchronously
                     convertSingleFile(i).then(() => {
                         activeConversions.delete(i);
-                        completedCount++;
                         
-                        // Small cooling delay (50ms) to let main-thread GC settle
+                        // Small cooling delay (50ms) to let main-thread garbage collector settle
                         setTimeout(runNextTasks, 50);
                     });
                     
@@ -598,7 +596,7 @@ async function startBatchConversion() {
                 if (!foundTask) break;
             }
 
-            // Final safety exit when all files are accounted for
+            // Final safety exit when all files are completed or failed
             const runningOrPending = selectedFiles.some((_, i) => {
                 const status = conversionResults[i]?.status;
                 return activeConversions.has(i) || (!status || (status !== 'success' && status !== 'failed'));
@@ -622,18 +620,25 @@ async function convertSingleFile(index) {
         return;
     }
     
-    const originalFileName = file.name; 
+    const originalFileName = file.name; // Save the unique identifier
     updateFileCardStatus(index, 'processing');
     
     try {
         console.log(`Converting parallel: ${file.name} [Limit: ${getConcurrencyLimit(file)}]`);
         
         const pngBlob = await convertJpgToPngSimple(file, index);
-        const currentIndex = selectedFiles.findIndex(f => f.name === originalFileName);
         
+        // Find the current index dynamically (safeguard against array shifting)
+        let currentIndex = selectedFiles.findIndex(f => f.name === originalFileName);
+        
+        // Fallback safety if findIndex returned -1 but the array position is still correct
+        if (currentIndex === -1 && selectedFiles[index] && selectedFiles[index].name === originalFileName) {
+            currentIndex = index;
+        }
+
         if (currentIndex === -1) {
             console.log(`File "${originalFileName}" was removed during conversion`);
-            return; 
+            return; // File was deleted, exit safely
         }
         
         conversionResults[currentIndex] = {
@@ -643,20 +648,28 @@ async function convertSingleFile(index) {
         };
         
         updateFileCardStatus(currentIndex, 'completed');
-        updateProgress(index, 100);
+        updateProgress(currentIndex, 100); // Progress completed successfully
         
     } catch (error) {
         console.error('Conversion failed:', error);
         
-        const currentIndex = selectedFiles.findIndex(f => f.name === originalFileName);
+        let currentIndex = selectedFiles.findIndex(f => f.name === originalFileName);
+        
+        if (currentIndex === -1 && selectedFiles[index] && selectedFiles[index].name === originalFileName) {
+            currentIndex = index;
+        }
+
         if (currentIndex !== -1) {
             conversionResults[currentIndex] = {
                 error: error.message,
                 status: 'failed'
             };
             updateFileCardStatus(currentIndex, 'failed');
+            updateProgress(currentIndex, 100);
+        } else {
+            // Still update the passed index progress so scheduler handles slots correctly
+            updateProgress(index, 100);
         }
-        updateProgress(index, 100);
     }
 }
 
@@ -670,6 +683,11 @@ let jpgPngWorkers = [];
 let jpgWorkerIndex = 0;
 window.qualityMode = 'best'; // Global source of truth
 
+// Global registry to route worker messages to their corresponding promises
+if (typeof activeWorkerCallbacks === 'undefined') {
+    var activeWorkerCallbacks = {};
+}
+
 async function initConverter() {
     try {
         const [upngRes, pakoRes] = await Promise.all([
@@ -681,6 +699,9 @@ async function initConverter() {
 
         const numWorkers = Math.min(navigator.hardwareConcurrency || 4, 6);
         
+        // Reset worker pool safely
+        jpgPngWorkers = [];
+        
         for (let i = 0; i < numWorkers; i++) {
             const workerCode = `
                 const window = self;
@@ -689,13 +710,14 @@ async function initConverter() {
                 ${upngCode}
                 
                 self.onmessage = async (e) => {
+                    const { taskId, buffer, mode } = e.data; // ⚡ Capture Task ID
                     try {
-                        const { buffer, mode } = e.data;
-                        self.postMessage({ type: 'progress', percent: 10 });
+                        self.postMessage({ taskId, type: 'progress', percent: 10 });
+                        
                         // Convert buffer back to blob for bitmap
                         const blob = new Blob([buffer]);
                         const bitmap = await createImageBitmap(blob);
-                        self.postMessage({ type: 'progress', percent: 30 });
+                        self.postMessage({ taskId, type: 'progress', percent: 30 });
                         
                         const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
                         const ctx = canvas.getContext("2d", { 
@@ -705,17 +727,17 @@ async function initConverter() {
                         
                         ctx.imageSmoothingEnabled = false; // 🔥 Speed up draw
                         ctx.drawImage(bitmap, 0, 0);
-                        self.postMessage({ type: 'progress', percent: 50 });
+                        self.postMessage({ taskId, type: 'progress', percent: 50 });
                         
                         let finalBuffer;
                         if (mode === 'optimized') {
                             const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height).data;
-                            self.postMessage({ type: 'progress', percent: 70 });
+                            self.postMessage({ taskId, type: 'progress', percent: 70 });
                             finalBuffer = UPNG.encode([imageData.buffer], bitmap.width, bitmap.height, 256);
                         } else {
-                            self.postMessage({ type: 'progress', percent: 60 });
+                            self.postMessage({ taskId, type: 'progress', percent: 60 });
                             const finalBlob = await canvas.convertToBlob({ type: "image/png" });
-                            self.postMessage({ type: 'progress', percent: 80 });
+                            self.postMessage({ taskId, type: 'progress', percent: 80 });
                             finalBuffer = await finalBlob.arrayBuffer();
                         }
 
@@ -724,17 +746,28 @@ async function initConverter() {
                         canvas.width = 1;
                         canvas.height = 1;
 
-                        self.postMessage({ type: 'progress', percent: 100 });
-                        self.postMessage({ buffer: finalBuffer }, [finalBuffer]);
+                        self.postMessage({ taskId, type: 'progress', percent: 100 });
+                        // ⚡ Transfer buffer back to Main Thread along with taskId
+                        self.postMessage({ taskId, buffer: finalBuffer }, [finalBuffer]);
 
                     } catch (err) {
-                        self.postMessage({ error: err.message });
+                        self.postMessage({ taskId, error: err.message });
                     }
                 };
             `;
             const workerUrl = URL.createObjectURL(new Blob([workerCode], { type: "application/javascript" }));
             const worker = new Worker(workerUrl);
             URL.revokeObjectURL(workerUrl);
+            
+            // ⚡ THE FIX: One permanent message router per worker. Never gets overwritten!
+            worker.onmessage = function(e) {
+                const { taskId } = e.data;
+                const callback = activeWorkerCallbacks[taskId];
+                if (callback) {
+                    callback(e.data);
+                }
+            };
+
             jpgPngWorkers.push(worker);
         }
         console.log("Converter Engine Ready.");
@@ -909,20 +942,26 @@ function convertJpgToPngSimple(jpgBlob, fileIndex) {
             const worker = jpgPngWorkers[jpgWorkerIndex];
             jpgWorkerIndex = (jpgWorkerIndex + 1) % jpgPngWorkers.length;
 
-            worker.onmessage = (e) => {
-                if (e.data.type === 'progress') {
-                    updateProgress(fileIndex, e.data.percent);
-                } else if (e.data?.error) {
-                    reject(e.data.error);
+            // ⚡ Generate a completely unique Task ID combining index and randomized string
+            const taskId = `${fileIndex}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+
+            // ⚡ Register callback inside the global registry mapped to the taskId
+            activeWorkerCallbacks[taskId] = function(workerData) {
+                if (workerData.type === 'progress') {
+                    updateProgress(fileIndex, workerData.percent);
+                } else if (workerData.error) {
+                    delete activeWorkerCallbacks[taskId]; // Clean up memory reference
+                    reject(new Error(workerData.error));
                 } else {
-                    const blob = new Blob([e.data.buffer], { type: 'image/png' });
+                    delete activeWorkerCallbacks[taskId]; // Clean up memory reference
+                    const blob = new Blob([workerData.buffer], { type: 'image/png' });
                     resolve(blob);
                 }
             };
 
-            // 🔥 TRANSFERABLE: Use the second argument to transfer the buffer
-            // This makes the data disappear from the Main Thread and appear in the Worker
+            // 🔥 TRANSFERABLE: Pass taskId along with the arrayBuffer
             worker.postMessage({ 
+                taskId: taskId,
                 buffer: arrayBuffer, 
                 mode: window.qualityMode 
             }, [arrayBuffer]);
