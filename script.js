@@ -399,13 +399,10 @@ function updateFileCardStatus(index, status) {
     }
 }
 
-// =========================================================
-// 🔒 LOCKED MASTER CONCURRENCY TABLE & HARDWARE DETECTION
-// =========================================================
+// ============ MAIN CONVERSION FUNCTIONS ============
+let activeConversions = new Set(); // Tracks currently running file indices
 
-/**
- * Robustly detects device type: 'desktop', 'tablet', or 'mobile'
- */
+// ============ DEVICE & CONCURRENCY PROFILE ============
 function getDeviceProfile() {
     const ua = navigator.userAgent;
     const isMobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
@@ -494,7 +491,7 @@ function getConcurrencyLimit(file) {
     return 1;
 }
 
-// ============ MAIN CONVERSION FUNCTIONS ============
+// ============ REPLACED BATCH CONVERSION SCHEDULER ============
 async function startBatchConversion() {
     // 🛡️ THE THUMBNAIL GUARD
     const guard = document.getElementById('thumbGuard');
@@ -503,6 +500,7 @@ async function startBatchConversion() {
         await waitForThumbnails(); 
         if (guard) guard.style.display = 'none';
     }
+    
     if (selectedFiles.length === 0) { showError('Please select files first'); return; }
 
     const allDone = selectedFiles.every((_, i) => 
@@ -511,28 +509,22 @@ async function startBatchConversion() {
     if (allDone) { showMessage('All files are already converted! ✨'); return; }
     if (isConverting) return;
 
-    // 🔥 FIX: Reuse already-calculated weights. 
-    // Fall back to a fast, non-blocking size estimation only if missing.
-    selectedFiles.forEach(f => {
-        if (!f.pixelWeight) {
-            // Rapid estimation (1 byte ≈ 1.5 pixels) with 100k px minimum
-            f.pixelWeight = Math.max(100000, f.size * 1.5); 
-        }
-    });
+    // Use your exact pre-calculated file contributions & weights (no recalculations)
+    await Promise.all(selectedFiles.map(f => getFileWeight(f)));
     
     totalPixelsInBatch = selectedFiles.reduce((acc, f) => acc + (f.pixelWeight || 0), 0);
     fileContributions = {};
     isConverting = true;
+    activeConversions.clear();
     showProgressModal(); 
 
-    // 🔥 If files were already converted (standalone), add them to bar NOW
+    // Sync already converted items (standalone)
     selectedFiles.forEach((f, i) => {
         if (conversionResults[i] && conversionResults[i].status === 'success') {
             fileContributions[i] = f.pixelWeight;
         }
     });
 
-    // Update targets immediately so the bar doesn't "jump" later
     targetPixels = Object.values(fileContributions).reduce((a, b) => a + b, 0);
     targetPercent = totalPixelsInBatch > 0 ? (targetPixels / totalPixelsInBatch) * 100 : 0;
     currentDisplayPercent = targetPercent; 
@@ -543,134 +535,119 @@ async function startBatchConversion() {
         convertBtn.textContent = 'Processing...';
     }
 
-    // =========================================================
-    // 🔥 MATRIX-DRIVEN SLIDING CONCURRENCY QUEUE ENGINE
-    // =========================================================
-    
-    // Gather all file indices that actually need conversion
-    const pendingIndices = [];
-    selectedFiles.forEach((_, i) => {
-        if (!conversionResults[i] || conversionResults[i].status !== 'success') {
-            pendingIndices.push(i);
-        }
-    });
+    // --- PARALLEL SCHEDULER IMPLEMENTATION ---
+    let completedCount = 0;
+    const totalFiles = selectedFiles.length;
 
-    let queueIndex = 0;        
-    let activeWorkerCount = 0;  
-
-    // This promise resolves once the entire batch finishes processing
-    await new Promise((resolveBatch) => {
+    return new Promise((resolve) => {
         
-        // Recursive worker runner
-        function runNext() {
-            if (queueIndex >= pendingIndices.length || !isConverting) {
-                // If queue is exhausted and no active workers are running, finish
-                if (activeWorkerCount === 0) {
-                    resolveBatch();
-                }
+        async function runNextTasks() {
+            if (!isConverting) {
+                resolve();
                 return;
             }
 
-            const targetIndex = pendingIndices[queueIndex++];
-            activeWorkerCount++;
-
-            // 🔥 NON-BLOCKING TRIGGER: Starts conversion and registers callbacks
-            convertSingleFile(targetIndex).then(async () => {
-                // Allow a brief 50ms breather for DOM rendering and Garbage Collection
-                await new Promise(r => setTimeout(r, 50)); 
-                
-                activeWorkerCount--;
-
-                if (!isConverting) {
-                    if (activeWorkerCount === 0) resolveBatch();
-                    return;
+            // Determine current pool safety ceiling based on active tasks
+            let currentAllowedLimit = 6; // Default ceiling
+            activeConversions.forEach(idx => {
+                const limit = getConcurrencyLimit(selectedFiles[idx]);
+                if (limit < currentAllowedLimit) {
+                    currentAllowedLimit = limit;
                 }
-
-                // Look ahead to check dynamic limits for the next file in the queue
-                const nextFileIndex = pendingIndices[queueIndex];
-                const nextFile = selectedFiles[nextFileIndex];
-                const allowedConcurrency = nextFile ? getConcurrencyLimit(nextFile) : 1;
-
-                // Spawn additional parallel runners if our hardware load capacity allows it
-                while (activeWorkerCount < allowedConcurrency && queueIndex < pendingIndices.length && isConverting) {
-                    runNext();
-                }
-
-                // Final safety check to resolve when queue runs completely dry
-                if (activeWorkerCount === 0 && queueIndex >= pendingIndices.length) {
-                    resolveBatch();
-                }
-            }).catch(err => {
-                console.error("Queue execution step failed:", err);
-                activeWorkerCount--;
-                
-                // Jump to next file immediately on unexpected failure so queue doesn't lock up
-                runNext(); 
             });
+
+            // Launch new tasks if we are under the allowed dynamic limit
+            while (isConverting && activeConversions.size < currentAllowedLimit) {
+                let foundTask = false;
+
+                // Look for the next files that fit our current capability profile
+                for (let i = 0; i < totalFiles; i++) {
+                    // Skip if already converting, failed, or successfully completed
+                    if (activeConversions.has(i)) continue;
+                    if (conversionResults[i] && (conversionResults[i].status === 'success' || conversionResults[i].status === 'failed')) continue;
+
+                    const fileLimit = getConcurrencyLimit(selectedFiles[i]);
+
+                    // Fast-lane skip check:
+                    // If we are currently running high-concurrency tasks, don't block
+                    // them unless this is the only remaining file to do.
+                    if (fileLimit < currentAllowedLimit && activeConversions.size > 0) {
+                        continue; 
+                    }
+
+                    // Handshake accepted! Run this file index
+                    foundTask = true;
+                    activeConversions.add(i);
+                    
+                    // Re-calculate ceiling with the new file inside the loop
+                    currentAllowedLimit = Math.min(currentAllowedLimit, fileLimit);
+
+                    // Execute conversion asynchronously
+                    convertSingleFile(i).then(() => {
+                        activeConversions.delete(i);
+                        completedCount++;
+                        
+                        // Small cooling delay (50ms) to let main-thread GC settle
+                        setTimeout(runNextTasks, 50);
+                    });
+                    
+                    break; // Break the 'for' loop to re-evaluate active pool counts
+                }
+
+                // If we scanned everything and found no fits, pause loop execution
+                if (!foundTask) break;
+            }
+
+            // Final safety exit when all files are accounted for
+            const runningOrPending = selectedFiles.some((_, i) => {
+                const status = conversionResults[i]?.status;
+                return activeConversions.has(i) || (!status || (status !== 'success' && status !== 'failed'));
+            });
+
+            if (!runningOrPending) {
+                finalizeConversion();
+                resolve();
+            }
         }
 
-        // Kickstart the initial parallel processing threads
-        const firstFile = selectedFiles[pendingIndices[0]];
-        const initialConcurrencyCeiling = firstFile ? getConcurrencyLimit(firstFile) : 1;
-        const initialSpawns = Math.min(initialConcurrencyCeiling, pendingIndices.length);
-
-        for (let i = 0; i < initialSpawns; i++) {
-            if (!isConverting) break;
-            runNext();
-        }
-
-        if (pendingIndices.length === 0) {
-            resolveBatch();
-        }
+        // Initialize the scheduler loop
+        runNextTasks();
     });
-
-    finalizeConversion();
 }
 
 async function convertSingleFile(index) {
-    // FIX: Get the file by index but also store its NAME immediately
     const file = selectedFiles[index];
     if (!file) {
         console.log(`File at index ${index} no longer exists`);
         return;
     }
     
-    const originalFileName = file.name; // Save the unique identifier
-    
-    // Update UI to show processing
+    const originalFileName = file.name; 
     updateFileCardStatus(index, 'processing');
     
     try {
-        console.log(`Converting: ${file.name} (${formatSize(file.size)})`);
+        console.log(`Converting parallel: ${file.name} [Limit: ${getConcurrencyLimit(file)}]`);
         
-        // Call conversion function
         const pngBlob = await convertJpgToPngSimple(file, index);
-        
-        // FIX: Find the current index by file name (in case array changed)
         const currentIndex = selectedFiles.findIndex(f => f.name === originalFileName);
         
         if (currentIndex === -1) {
             console.log(`File "${originalFileName}" was removed during conversion`);
-            return; // File was deleted, skip saving result
+            return; 
         }
         
-        // Store the result at the CORRECT current index
         conversionResults[currentIndex] = {
             blob: pngBlob,
             fileName: originalFileName.replace(/\.[^/.]+$/, "") + '.png',
             status: 'success'
         };
         
-        // Update UI at the CORRECT current index
         updateFileCardStatus(currentIndex, 'completed');
-        
-        // Update progress using the correct real-time index
-        updateProgress(currentIndex, 100);
+        updateProgress(index, 100);
         
     } catch (error) {
         console.error('Conversion failed:', error);
         
-        // FIX: Find correct dynamic index for error case too
         const currentIndex = selectedFiles.findIndex(f => f.name === originalFileName);
         if (currentIndex !== -1) {
             conversionResults[currentIndex] = {
@@ -678,12 +655,8 @@ async function convertSingleFile(index) {
                 status: 'failed'
             };
             updateFileCardStatus(currentIndex, 'failed');
-            
-            // Pass the correct real-time index to updateProgress
-            updateProgress(currentIndex, 100);
-        } else {
-            updateProgress(index, 100);
         }
+        updateProgress(index, 100);
     }
 }
 
