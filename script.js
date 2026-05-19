@@ -374,7 +374,7 @@ function updateFileCardStatus(index, status) {
     card.dataset.index = index;
 
     // 4. Update the classes and button as usual
-    card.classList.remove('processing', 'completed', 'failed');
+    card.classList.remove('processing', 'completed', 'failed', 'waiting');
     if (status !== 'pending') card.classList.add(status);
     
     const btn = card.querySelector('.convert-single-btn');
@@ -399,7 +399,6 @@ function updateFileCardStatus(index, status) {
     }
 }
 
-// ============ NEW GLOBAL CONCURRENCY TRACKER ============
 let activeConversions = new Set(); // Tracks currently running file indices
 
 // ============ DEVICE & CONCURRENCY PROFILE ============
@@ -494,6 +493,19 @@ function getConcurrencyLimit(file) {
 // ============ MAIN CONVERSION FUNCTIONS ============
 async function startBatchConversion() {
     // 🛡️ THE THUMBNAIL GUARD
+    // 1. Clear the standalone queue entirely
+    waitingQueue = [];
+    isStandaloneQueueRunning = false;
+
+    // 2. Reset all buttons that were "Waiting" back to "Convert"
+    // This makes them functionally ready for the Batch Loop
+    selectedFiles.forEach((_, idx) => {
+        const res = conversionResults[idx];
+        if (!res || res.status !== 'success') {
+            // Only reset if it's not already finished
+            updateFileCardStatus(idx, 'pending'); 
+        }
+    });
     const guard = document.getElementById('thumbGuard');
     if (pendingThumbnails > 0) {
         if (guard) guard.style.display = 'flex';
@@ -972,90 +984,161 @@ function convertJpgToPngSimple(jpgBlob, fileIndex) {
     });
 }
 
+let waitingQueue = []; // Array of indices waiting for standalone conversion
+let isStandaloneQueueRunning = false;
 
 // ============ CONVERT SINGLE FILE (STANDALONE) ============
 async function convertSingleFileStandalone(index) {
     // 🛡️ THE THUMBNAIL GUARD
-    const guard = document.getElementById('thumbGuard');
     if (pendingThumbnails > 0) {
+        const guard = document.getElementById('thumbGuard');
         if (guard) guard.style.display = 'flex';
         await waitForThumbnails(); 
         if (guard) guard.style.display = 'none';
     }
-    // 1. Force reset if a previous batch was cancelled/hidden
-    const modal = document.getElementById('progressModal');
-    const isModalVisible = modal && modal.style.display === 'flex';
-    
-    if (isConverting && !isModalVisible) {
-        console.log("Forcing state reset - no active batch visible.");
-        isConverting = false; 
-    }
 
-    // 2. True safety check
     if (isConverting) {
-        showError('A batch conversion is in progress. Please wait.');
+        showError('Batch conversion is active.');
         return;
     }
 
-    // Capture the specific file and its name IMMEDIATELY
-    const file = selectedFiles[index];
-    if (!file) return;
-    const originalName = file.name; 
-    const myConversionId = standaloneConversionId;
+    // Check if already in queue or results
+    if (waitingQueue.includes(index) || activeConversions.has(index)) return;
+    if (conversionResults[index] && conversionResults[index].status === 'success') return;
 
-    // 3. Start Conversion
-    isConverting = true;
-    updateFileCardStatus(index, 'processing');
+    // Add to queue
+    waitingQueue.push(index);
+    updateWaitingUI();
 
-    try {
-        // Core conversion logic
-        const pngBlob = await convertJpgToPngSimple(file,index);
-        if (myConversionId !== standaloneConversionId) return;
-        
-        // --- THE FIX: Find the FRESH index right now ---
-        // If the user deleted a file while we were waiting for the blob, 
-        // the original 'index' is now wrong. We find where the file is NOW.
-        const currentIndex = selectedFiles.findIndex(f => f.name === originalName);
-        
-        // If the file was deleted entirely during conversion, stop here.
-        if (currentIndex === -1) {
-            console.log("File removed during conversion, discarding result.");
-            return;
+    // Start manager if not running
+    if (!isStandaloneQueueRunning) {
+        processStandaloneQueue();
+    }
+}
+
+async function processStandaloneQueue() {
+    // If Batch conversion starts, or queue is empty, exit immediately
+    if (waitingQueue.length === 0 || isConverting) {
+        isStandaloneQueueRunning = false;
+        return;
+    }
+
+    isStandaloneQueueRunning = true;
+
+    const primaryIndex = waitingQueue.shift();
+    // Validate file exists
+    const primaryFile = selectedFiles[primaryIndex];
+    if (!primaryFile) return processStandaloneQueue();
+
+    const targetConcurrency = getConcurrencyLimit(primaryFile);
+    const batchToProcess = [primaryIndex];
+
+    // Grouping logic
+    if (targetConcurrency > 1) {
+        for (let i = 0; i < waitingQueue.length; i++) {
+            if (batchToProcess.length >= targetConcurrency) break;
+            const candIdx = waitingQueue[i];
+            if (selectedFiles[candIdx] && getConcurrencyLimit(selectedFiles[candIdx]) === targetConcurrency) {
+                batchToProcess.push(candIdx);
+                waitingQueue.splice(i, 1);
+                i--;
+            }
         }
+    }
 
-        // Store the result at the CORRECT current index
-        conversionResults[currentIndex] = {
-            blob: pngBlob,
-            fileName: originalName.replace(/\.[^/.]+$/, "") + '.png',
-            status: 'success'
-        };
+    updateWaitingUI();
 
-        // Update the UI at the CORRECT current index
-        updateFileCardStatus(currentIndex, 'completed');   
+    const currentId = standaloneConversionId;
+
+    await Promise.all(batchToProcess.map(async (idx) => {
+        const file = selectedFiles[idx];
+        if (!file) return;
         
-    } catch (error) {
-        if (myConversionId !== standaloneConversionId) return;
-        if (!isConverting && !isModalVisible) return;
+        const originalName = file.name; // Capture for the "Double Lock"
+        activeConversions.add(idx);
+        updateFileCardStatus(idx, 'processing');
         
-        console.error('Conversion failed:', error);
-        
-        // Find fresh index for error handling too
-        const currentIndex = selectedFiles.findIndex(f => f.name === originalName);
-        if (currentIndex !== -1) {
-            updateFileCardStatus(currentIndex, 'failed');
-            showError(`Failed to convert ${originalName}`);
+        try {
+            const blob = await convertJpgToPngSimple(file, idx);
+            
+            // SECURITY CHECK: If user cancelled or removed while processing
+            if (currentId !== standaloneConversionId) return;
+
+            // 🔥 THE FIX: Find the FRESH index by name
+            const freshIndex = selectedFiles.findIndex(f => f.name === originalName);
+            
+            if (freshIndex !== -1) {
+                conversionResults[freshIndex] = {
+                    blob: blob,
+                    fileName: originalName.replace(/\.[^/.]+$/, "") + '.png',
+                    status: 'success'
+                };
+                updateFileCardStatus(freshIndex, 'completed');
+            }
+        } catch (e) {
+            console.error("Task Error:", e);
+            const freshIndex = selectedFiles.findIndex(f => f.name === originalName);
+            if (freshIndex !== -1) updateFileCardStatus(freshIndex, 'failed');
+        } finally {
+            // Cleanup based on the index we started with (Set logic handles this fine)
+            activeConversions.delete(idx);
         }
-    } finally {
-        if (myConversionId === standaloneConversionId) {
-            isConverting = false;
+    }));
+
+    // Bridge logic: If "Convert All" wasn't clicked, keep the standalone queue moving
+    if (!isConverting) {
+        processStandaloneQueue();
+    } else {
+        isStandaloneQueueRunning = false;
+        // The startBatchConversion logic will naturally take over here
+        // as it checks for existing results in conversionResults[i]
+    }
+}
+
+function updateWaitingUI() {
+    const previewGrid = document.getElementById('previewGrid');
+    if (!previewGrid) return;
+
+    const allCards = previewGrid.getElementsByClassName('preview-card');
+    const waitingSet = new Set(waitingQueue);
+
+    // Part 1: Update Waiting List
+    waitingQueue.forEach((fileIdx, index) => {
+        const card = previewGrid.querySelector(`[data-index="${fileIdx}"]`);
+        if (card) {
+            const btn = card.querySelector('.convert-single-btn');
+            // Only update if not already actively processing
+            if (btn && !card.classList.contains('processing')) {
+                const newText = `Waiting (${index + 1})`;
+                if (btn.textContent !== newText) {
+                    btn.textContent = newText;
+                    btn.disabled = true;
+                    btn.classList.add('waiting'); 
+                    card.classList.add('waiting');
+                }
+            }
         }
-        const hasSuccess = Object.values(conversionResults).some(r => r.status === 'success');
-        
-        // 2. Find the Download All button (make sure the ID matches your HTML)
-        const downloadAllBtn = document.querySelector('.btn-download'); 
-        
-        if (downloadAllBtn && hasSuccess) {
-            downloadAllBtn.style.display = 'block'; // Show it!
+    });
+
+    // Part 2: The Hardened Cleanup
+    for (let i = 0; i < allCards.length; i++) {
+        const card = allCards[i];
+        const idx = parseInt(card.dataset.index);
+
+        // ONLY reset if it's NOT waiting AND NOT processing
+        if (!waitingSet.has(idx) && !activeConversions.has(idx) && !card.classList.contains('processing')) {
+            const result = conversionResults[idx];
+            if (!result || result.status !== 'success') {
+                const btn = card.querySelector('.convert-single-btn');
+                if (btn && (btn.textContent !== 'Convert' || btn.disabled)) {
+                    btn.textContent = 'Convert';
+                    btn.classList.remove('waiting'); 
+                    card.classList.remove('waiting');
+                    btn.disabled = false;
+                    btn.style.opacity = "1";
+                    btn.style.pointerEvents = "auto";
+                }
+            }
         }
     }
 }
@@ -1236,6 +1319,9 @@ var cancelAllBtn=document.querySelector(".btn-cancel");
 cancelAllBtn.addEventListener("click",cancelAllConversions);
 
 function cancelAllConversions() {
+    isStandaloneQueueRunning = false; 
+    waitingQueue = []; 
+    activeConversions.clear();
     // 1. Force the batch loop to stop immediately
     if (animationFrame) {
         cancelAnimationFrame(animationFrame);
@@ -1308,30 +1394,60 @@ function removeFile(index) {
     const targetIndex = parseInt(index);
     const card = document.querySelector(`.preview-card[data-index="${targetIndex}"]`);
     
-    if (card && card.classList.contains('processing')) {
+    const isProcessing = card && card.classList.contains('processing');
+
+    if (isProcessing || activeConversions.has(targetIndex)) {
         isConverting = false; 
-        standaloneConversionId++;
+        isStandaloneQueueRunning = false;
+        standaloneConversionId++; 
+        
+        waitingQueue = []; 
+        activeConversions.clear();
+
         if (Array.isArray(jpgPngWorkers) && jpgPngWorkers.length > 0) {
             jpgPngWorkers.forEach(w => w.terminate());
             jpgPngWorkers = [];
             jpgWorkerIndex = 0;
-            initConverter(); 
+            if (typeof initConverter === 'function') initConverter(); 
         }
+
+        selectedFiles.forEach((_, i) => {
+            const result = conversionResults[i];
+            if (!result || result.status !== 'success') {
+                updateFileCardStatus(i, 'pending');
+                const fileCard = document.querySelector(`.preview-card[data-index="${i}"]`);
+                if (fileCard) {
+                    fileCard.classList.remove('waiting', 'processing');
+                    const btn = fileCard.querySelector('.convert-single-btn');
+                    if (btn) {
+                        btn.textContent = 'Convert';
+                        btn.disabled = false;
+                        btn.classList.remove('waiting');
+                        btn.style.opacity = "1";
+                        btn.style.pointerEvents = "auto";
+                    }
+                }
+            }
+        });
+        showMessage('Process stopped and queue cleared');
+    } else {
+        waitingQueue = waitingQueue.filter(idx => idx !== targetIndex)
+                                   .map(idx => (idx > targetIndex ? idx - 1 : idx));
     }
-    
+
     selectedFiles.splice(targetIndex, 1);
     
     const newResults = {};
     for (let i = 0; i < selectedFiles.length; i++) {
         let oldIndex = (i >= targetIndex) ? i + 1 : i;
-        if (conversionResults[oldIndex]) newResults[i] = conversionResults[oldIndex];
+        if (conversionResults[oldIndex]) {
+            newResults[i] = conversionResults[oldIndex];
+        }
     }
     conversionResults = newResults;
 
-    // 🔥 FIX 3: REBUILD PIXEL MATH FROM ZERO (No ghost pixels)
     totalPixelsInBatch = 0;
     fileContributions = {};
-
     selectedFiles.forEach((file, i) => {
         const weight = file.pixelWeight || 0;
         totalPixelsInBatch += weight;
@@ -1343,21 +1459,48 @@ function removeFile(index) {
     targetPixels = Object.values(fileContributions).reduce((a, b) => a + b, 0);
     targetPercent = totalPixelsInBatch > 0 ? (targetPixels / totalPixelsInBatch) * 100 : 0;
 
-    const previewGrid = document.getElementById('previewGrid');
     if (card) {
         card.remove(); 
-        const remainingCards = previewGrid.querySelectorAll('.preview-card');
-        remainingCards.forEach((c, i) => { c.dataset.index = i; });
+        // 🔥 SYNC DOM INDICES IMMEDIATELY
+        const remainingCards = document.querySelectorAll('.preview-card');
+        remainingCards.forEach((c, i) => { 
+            c.dataset.index = i; 
+        });
+
+        // Cleanup styles if queue is now empty
+        if (waitingQueue.length === 0 && activeConversions.size === 0) {
+            remainingCards.forEach((c, i) => {
+                const res = conversionResults[i];
+                if (!res || res.status !== 'success') {
+                    c.classList.remove('waiting', 'processing');
+                    const sBtn = c.querySelector('.convert-single-btn');
+                    if (sBtn) {
+                        sBtn.textContent = 'Convert';
+                        sBtn.disabled = false;
+                        sBtn.classList.remove('waiting');
+                        sBtn.style.opacity = "1";
+                        sBtn.style.pointerEvents = "auto";
+                    }
+                    updateFileCardStatus(i, 'pending');
+                }
+            });
+        }
     }
 
     updateFileCount();      
     updateDropzoneText();   
+    updateWaitingUI(); 
     
     if (selectedFiles.length === 0) {
         hidePreviewSection();
         updateFilePreviews();
     }
-    if (document.getElementById('convertBtn')) document.getElementById('convertBtn').textContent = `Convert All`;
+    
+    const convertBtn = document.getElementById('convertBtn');
+    if (convertBtn) {
+        convertBtn.textContent = `Convert All`;
+        convertBtn.disabled = false;
+    }
 }
 
 function clearAllFiles() {
@@ -1365,6 +1508,9 @@ function clearAllFiles() {
     
     selectedFiles = [];
     conversionResults = {};
+    waitingQueue = [];
+    isStandaloneQueueRunning = false;
+    activeConversions.clear();
     updateFilePreviews();
     hidePreviewSection();
     updateDropzoneText();
